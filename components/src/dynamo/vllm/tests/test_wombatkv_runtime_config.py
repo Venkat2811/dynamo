@@ -31,6 +31,7 @@ def _vllm_config(
         cache_config=SimpleNamespace(
             kv_offloading_backend=backend,
             kv_offloading_size=offloading_size,
+            prefix_caching_hash_algo="sha256",
         ),
         kv_transfer_config=SimpleNamespace(
             kv_connector_extra_config=extra_config or {},
@@ -38,6 +39,11 @@ def _vllm_config(
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
+        ),
+        model_config=SimpleNamespace(
+            model="Qwen/Qwen3-0.6B",
+            revision=None,
+            dtype="torch.bfloat16",
         ),
     )
 
@@ -72,6 +78,8 @@ def test_wombatkv_runtime_data_uses_extra_config():
                 "shared_cache_timeout_ms": "75",
                 "model_fingerprint": "model-digest",
                 "layout_fingerprint": "layout-digest",
+                "key_prefix": "custom/vllm",
+                "kv_cache_groups": "2",
             },
             tp_size=2,
         ),
@@ -86,6 +94,15 @@ def test_wombatkv_runtime_data_uses_extra_config():
         "timeout_ms": 75,
         "model_fingerprint": "model-digest",
         "layout_fingerprint": "layout-digest",
+        "key_prefix": "custom/vllm",
+        "prefix_caching_hash_algo": "sha256",
+        "vllm_model": "Qwen/Qwen3-0.6B",
+        "dtype": "torch.bfloat16",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "gpu_block_tokens": [16],
+        "offload_block_tokens": 16,
+        "kv_cache_groups": 2,
     }
 
 
@@ -94,6 +111,11 @@ def test_wombatkv_runtime_data_env_overrides(monkeypatch):
     monkeypatch.setenv("DYN_WOMBATKV_SHARED_CACHE_ENDPOINT", "127.0.0.1:9999")
     monkeypatch.setenv("DYN_WOMBATKV_MODEL_FINGERPRINT", "env-model")
     monkeypatch.setenv("DYN_WOMBATKV_LAYOUT_FINGERPRINT", "env-layout")
+    monkeypatch.setenv("DYN_WOMBATKV_VLLM_MODEL", "env-vllm-model")
+    monkeypatch.setenv("DYN_WOMBATKV_DTYPE", "env-dtype")
+    monkeypatch.setenv("DYN_WOMBATKV_KV_CACHE_GROUPS", "3")
+    monkeypatch.setenv("DYN_WOMBATKV_GPU_BLOCK_TOKENS", "32")
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
 
     data = get_wombatkv_shared_cache_runtime_data(
         _config(model="base-model"),
@@ -108,4 +130,14 @@ def test_wombatkv_runtime_data_env_overrides(monkeypatch):
         "endpoint": "127.0.0.1:9999",
         "model_fingerprint": "env-model",
         "layout_fingerprint": "env-layout",
+        "key_prefix": "wkv/vllm",
+        "prefix_caching_hash_algo": "sha256",
+        "python_hash_seed": "0",
+        "vllm_model": "env-vllm-model",
+        "dtype": "env-dtype",
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "gpu_block_tokens": [32],
+        "offload_block_tokens": 32,
+        "kv_cache_groups": 3,
     }

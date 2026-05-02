@@ -759,10 +759,54 @@ def get_wombatkv_shared_cache_runtime_data(
     )
 
     parallel_config = getattr(vllm_config, "parallel_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
     tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
     pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
     block_size = int(runtime_values["block_size"])
     model_name = str(config.served_model_name or config.model)
+    vllm_model = str(
+        os.getenv("DYN_WOMBATKV_VLLM_MODEL")
+        or extra_config.get("vllm_model")
+        or extra_config.get("model")
+        or getattr(model_config, "model", None)
+        or config.model
+    )
+    revision = (
+        os.getenv("DYN_WOMBATKV_REVISION")
+        or extra_config.get("revision")
+        or getattr(model_config, "revision", None)
+    )
+    dtype = str(
+        os.getenv("DYN_WOMBATKV_DTYPE")
+        or extra_config.get("dtype")
+        or getattr(model_config, "dtype", None)
+        or getattr(model_config, "torch_dtype", None)
+        or "unknown"
+    )
+    key_prefix = str(
+        os.getenv("DYN_WOMBATKV_KEY_PREFIX")
+        or extra_config.get("key_prefix")
+        or "wkv/vllm"
+    )
+    prefix_hash_algo = str(
+        os.getenv("DYN_WOMBATKV_PREFIX_CACHING_HASH_ALGO")
+        or extra_config.get("prefix_caching_hash_algo")
+        or getattr(cache_config, "prefix_caching_hash_algo", None)
+        or "sha256"
+    )
+    python_hash_seed = os.getenv("PYTHONHASHSEED")
+    kv_cache_groups = _optional_positive_int(
+        os.getenv("DYN_WOMBATKV_KV_CACHE_GROUPS")
+        or extra_config.get("kv_cache_groups")
+    )
+    offload_block_tokens = _optional_positive_int(
+        os.getenv("DYN_WOMBATKV_OFFLOAD_BLOCK_TOKENS")
+        or extra_config.get("offload_block_tokens")
+    )
+    gpu_block_tokens = _optional_int_list(
+        os.getenv("DYN_WOMBATKV_GPU_BLOCK_TOKENS")
+        or extra_config.get("gpu_block_tokens")
+    )
 
     runtime_data: dict[str, Any] = {
         "backend": "wombatkv",
@@ -778,7 +822,20 @@ def get_wombatkv_shared_cache_runtime_data(
             or extra_config.get("layout_fingerprint")
             or f"vllm:{model_name}:tp={tp_size}:pp={pp_size}:block={block_size}"
         ),
+        "key_prefix": key_prefix,
+        "prefix_caching_hash_algo": prefix_hash_algo,
+        "vllm_model": vllm_model,
+        "dtype": dtype,
+        "tensor_parallel_size": tp_size,
+        "pipeline_parallel_size": pp_size,
+        "gpu_block_tokens": gpu_block_tokens or [block_size],
+        "offload_block_tokens": offload_block_tokens or block_size,
+        "kv_cache_groups": kv_cache_groups or 1,
     }
+    if revision is not None:
+        runtime_data["revision"] = str(revision)
+    if python_hash_seed is not None:
+        runtime_data["python_hash_seed"] = python_hash_seed
     if endpoint:
         runtime_data["endpoint"] = str(endpoint)
     if timeout_ms is not None:
@@ -793,6 +850,21 @@ def _optional_positive_int(value: object) -> int | None:
     parsed = int(value)
     if parsed <= 0:
         raise ValueError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _optional_int_list(value: object) -> list[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ValueError(f"expected comma-separated string or list, got {value!r}")
+    parsed = [int(item) for item in items]
+    if not parsed or any(item <= 0 for item in parsed):
+        raise ValueError(f"expected positive integers, got {value!r}")
     return parsed
 
 

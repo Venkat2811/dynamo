@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MOONCAKE_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
-const WOMBATKV_HTTP_TIMEOUT: Duration = Duration::from_millis(50);
+const WOMBATKV_HTTP_TIMEOUT: Duration = Duration::from_millis(250);
 
 use dynamo_kv_router::{
     SharedKvCache,
@@ -84,6 +84,28 @@ struct WombatKvSharedCacheConfig {
     layout_fingerprint: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    key_prefix: Option<String>,
+    #[serde(default)]
+    prefix_caching_hash_algo: Option<String>,
+    #[serde(default)]
+    python_hash_seed: Option<String>,
+    #[serde(default)]
+    vllm_model: Option<String>,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    dtype: Option<String>,
+    #[serde(default)]
+    tensor_parallel_size: Option<u32>,
+    #[serde(default)]
+    pipeline_parallel_size: Option<u32>,
+    #[serde(default)]
+    gpu_block_tokens: Option<Vec<u32>>,
+    #[serde(default)]
+    offload_block_tokens: Option<u32>,
+    #[serde(default)]
+    kv_cache_groups: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +118,28 @@ struct WombatKvCheckBlocksRequest<'a> {
     model_fingerprint: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     layout_fingerprint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_prefix: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_caching_hash_algo: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    python_hash_seed: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vllm_model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dtype: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tensor_parallel_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipeline_parallel_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_block_tokens: Option<&'a [u32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offload_block_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_cache_groups: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -318,6 +362,17 @@ impl SharedKvCache for WombatKvSharedCache {
             namespace: config.namespace.as_deref(),
             model_fingerprint: config.model_fingerprint.as_deref(),
             layout_fingerprint: config.layout_fingerprint.as_deref(),
+            key_prefix: config.key_prefix.as_deref(),
+            prefix_caching_hash_algo: config.prefix_caching_hash_algo.as_deref(),
+            python_hash_seed: config.python_hash_seed.as_deref(),
+            vllm_model: config.vllm_model.as_deref(),
+            revision: config.revision.as_deref(),
+            dtype: config.dtype.as_deref(),
+            tensor_parallel_size: config.tensor_parallel_size,
+            pipeline_parallel_size: config.pipeline_parallel_size,
+            gpu_block_tokens: config.gpu_block_tokens.as_deref(),
+            offload_block_tokens: config.offload_block_tokens,
+            kv_cache_groups: config.kv_cache_groups,
         };
 
         let mut builder = self.http_client.post(endpoint.clone()).json(&request);
@@ -710,6 +765,17 @@ mod tests {
             model_fingerprint: Some("model-fp".to_string()),
             layout_fingerprint: Some("layout-fp".to_string()),
             timeout_ms: Some(250),
+            key_prefix: Some("wkv/vllm".to_string()),
+            prefix_caching_hash_algo: Some("sha256".to_string()),
+            python_hash_seed: Some("0".to_string()),
+            vllm_model: Some("Qwen/Qwen3-0.6B".to_string()),
+            revision: None,
+            dtype: Some("torch.bfloat16".to_string()),
+            tensor_parallel_size: Some(1),
+            pipeline_parallel_size: Some(1),
+            gpu_block_tokens: Some(vec![4]),
+            offload_block_tokens: Some(4),
+            kv_cache_groups: Some(1),
         }
     }
 
