@@ -19,8 +19,9 @@ use dynamo_runtime::{
 
 use crate::{
     kv_router::{
-        KvRouter, router_endpoint_id, scheduler::DefaultWorkerSelector,
-        shared_cache::HicacheSharedKvCache,
+        KvRouter, router_endpoint_id,
+        scheduler::DefaultWorkerSelector,
+        shared_cache::{HicacheSharedKvCache, WombatKvSharedCache},
     },
     local_model::runtime_config::DisaggregatedEndpoint,
     model_card::ModelDeploymentCard,
@@ -628,6 +629,16 @@ impl ModelManager {
                     "Using HiCache shared KV cache"
                 );
                 Some(Box::new(HicacheSharedKvCache::new(
+                    workers_with_configs.clone(),
+                )))
+            }
+            dynamo_kv_router::SharedCacheType::WombatKv => {
+                let worker_component_name = &endpoint.id().component;
+                tracing::info!(
+                    worker_component = worker_component_name,
+                    "Using WombatKV shared KV cache"
+                );
+                Some(Box::new(WombatKvSharedCache::new(
                     workers_with_configs.clone(),
                 )))
             }

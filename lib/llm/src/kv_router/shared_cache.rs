@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HiCache shared KV cache client for SGLang + Mooncake.
+//! Shared KV cache clients used by the KV router.
 //!
-//! Instead of querying a worker endpoint over the request plane, this client:
+//! `HicacheSharedKvCache` supports SGLang + Mooncake HiCache.
+//! `WombatKvSharedCache` supports the first-party WombatKV/TensorPuffer
+//! control-plane lookup used by Dynamo routing.
+//!
+//! Instead of querying a worker endpoint over the request plane, HiCache:
 //! 1. Reads Mooncake HiCache metadata published by SGLang workers in runtime config.
 //! 2. Recomputes the logical HiCache page hashes from request tokens using the
 //!    same token -> page-hash logic as SGLang.
@@ -20,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MOONCAKE_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+const WOMBATKV_HTTP_TIMEOUT: Duration = Duration::from_millis(50);
 
 use dynamo_kv_router::{
     SharedKvCache,
@@ -30,6 +35,7 @@ use dynamo_kv_router::{
 use crate::{discovery::RuntimeConfigWatch, local_model::runtime_config::ModelRuntimeConfig};
 
 const SGLANG_HICACHE_MOONCAKE_RUNTIME_KEY: &str = "sglang_hicache_mooncake";
+const WOMBATKV_SHARED_CACHE_RUNTIME_KEY: &str = "wombatkv_shared_cache";
 const MOONCAKE_BATCH_QUERY_KEYS_CHUNK_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -58,6 +64,62 @@ struct MooncakeBatchQueryKeysResponse {
 struct MooncakeBatchQueryKeyResult {
     #[serde(default)]
     ok: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct WombatKvSharedCacheConfig {
+    /// Runtime backend marker. Accepted values are "wombatkv" and
+    /// "tensorpuffer"; aliases keep old planning docs and code aligned.
+    backend: String,
+    /// KV page/block size used by the engine-side WombatKV cache.
+    block_size: u32,
+    /// HTTP endpoint for prompt/token hit checks. If the path is omitted,
+    /// `/check_blocks` is appended.
+    endpoint: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    model_fingerprint: Option<String>,
+    #[serde(default)]
+    layout_fingerprint: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct WombatKvCheckBlocksRequest<'a> {
+    tokens: &'a [u32],
+    block_size: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespace: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_fingerprint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout_fingerprint: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WombatKvCheckBlocksResponse {
+    /// Optional success flag. Missing means success for compatibility with
+    /// simple test/prototype servers.
+    #[serde(default)]
+    success: Option<bool>,
+    /// Boolean hit vector by block position.
+    #[serde(default)]
+    hits: Vec<bool>,
+    /// Coalesced half-open hit ranges. `ranges` matches Dynamo's dummy shared
+    /// cache response; `hit_ranges` is accepted for WombatKV readability.
+    #[serde(default)]
+    ranges: Vec<WombatKvHitRange>,
+    #[serde(default)]
+    hit_ranges: Vec<WombatKvHitRange>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum WombatKvHitRange {
+    Array([u32; 2]),
+    Object { start: u32, end: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +223,145 @@ impl HicacheSharedKvCache {
     }
 }
 
+/// Shared KV cache client for WombatKV/TensorPuffer.
+///
+/// Workers publish a `wombatkv_shared_cache` runtime config. The router uses it
+/// to ask the WombatKV control-plane service which prompt blocks are already
+/// materialized before selecting a worker. Query failures are surfaced as
+/// `KvRouterError` and the router treats them as fail-open empty hits.
+pub struct WombatKvSharedCache {
+    runtime_configs: RuntimeConfigWatch,
+    http_client: reqwest::Client,
+}
+
+impl WombatKvSharedCache {
+    pub fn new(runtime_configs: RuntimeConfigWatch) -> Self {
+        Self {
+            runtime_configs,
+            http_client: reqwest::Client::builder()
+                .timeout(WOMBATKV_HTTP_TIMEOUT)
+                .build()
+                .expect("failed to build reqwest client"),
+        }
+    }
+
+    fn resolve_config(&self) -> Option<WombatKvSharedCacheConfig> {
+        let workers = self.runtime_configs.borrow();
+        let mut configs = Vec::new();
+
+        for (worker_id, runtime_config) in workers.iter() {
+            if let Some(config) = wombatkv_config_from_runtime(*worker_id, runtime_config) {
+                configs.push((*worker_id, config));
+            }
+        }
+
+        let (_, first) = configs.first()?;
+
+        if configs.iter().any(|(_, config)| config != first) {
+            tracing::warn!(
+                workers = ?configs.iter().map(|(worker_id, _)| *worker_id).collect::<Vec<_>>(),
+                "WombatKV shared-cache runtime configs differ across workers; skipping shared-cache lookup"
+            );
+            return None;
+        }
+
+        Some(first.clone())
+    }
+}
+
+#[async_trait]
+impl SharedKvCache for WombatKvSharedCache {
+    async fn check_blocks(
+        &self,
+        tokens: &[u32],
+        block_size: u32,
+    ) -> Result<SharedCacheHits, KvRouterError> {
+        let Some(config) = self.resolve_config() else {
+            tracing::debug!("No WombatKV shared-cache runtime config available");
+            return Ok(SharedCacheHits::default());
+        };
+
+        if !matches!(config.backend.as_str(), "wombatkv" | "tensorpuffer") {
+            tracing::debug!(
+                backend = %config.backend,
+                "Skipping non-WombatKV shared-cache config"
+            );
+            return Ok(SharedCacheHits::default());
+        }
+
+        if config.block_size == 0 || block_size == 0 {
+            tracing::warn!(
+                worker_block_size = config.block_size,
+                router_block_size = block_size,
+                "Invalid WombatKV shared-cache block size; skipping lookup"
+            );
+            return Ok(SharedCacheHits::default());
+        }
+
+        if config.block_size != block_size {
+            tracing::warn!(
+                worker_block_size = config.block_size,
+                router_block_size = block_size,
+                "WombatKV shared-cache block size mismatch; skipping lookup"
+            );
+            return Ok(SharedCacheHits::default());
+        }
+
+        let Some(endpoint) = wombatkv_check_blocks_endpoint(&config) else {
+            tracing::debug!("WombatKV shared-cache endpoint is unavailable");
+            return Ok(SharedCacheHits::default());
+        };
+
+        let request = WombatKvCheckBlocksRequest {
+            tokens,
+            block_size,
+            namespace: config.namespace.as_deref(),
+            model_fingerprint: config.model_fingerprint.as_deref(),
+            layout_fingerprint: config.layout_fingerprint.as_deref(),
+        };
+
+        let mut builder = self.http_client.post(endpoint.clone()).json(&request);
+        if let Some(timeout_ms) = config.timeout_ms {
+            builder = builder.timeout(Duration::from_millis(timeout_ms));
+        }
+
+        let response = builder.send().await.map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                url = %endpoint,
+                "WombatKV shared-cache check_blocks request failed"
+            );
+            KvRouterError::IndexerOffline
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            tracing::warn!(
+                status = %status,
+                url = %endpoint,
+                "WombatKV shared-cache check_blocks returned non-success status"
+            );
+            return Err(KvRouterError::IndexerOffline);
+        }
+
+        let body: WombatKvCheckBlocksResponse = response.json().await.map_err(|error| {
+            tracing::warn!(
+                error = %error,
+                url = %endpoint,
+                "Failed to decode WombatKV shared-cache check_blocks response"
+            );
+            KvRouterError::IndexerOffline
+        })?;
+
+        if body.success == Some(false) {
+            tracing::warn!(url = %endpoint, "WombatKV shared-cache check_blocks reported failure");
+            return Err(KvRouterError::IndexerOffline);
+        }
+
+        Ok(wombatkv_response_to_hits(body))
+    }
+}
+
 #[async_trait]
 impl SharedKvCache for HicacheSharedKvCache {
     async fn check_blocks(
@@ -223,6 +424,69 @@ impl SharedKvCache for HicacheSharedKvCache {
 
         Ok(SharedCacheHits::from_hits(&page_hits))
     }
+}
+
+fn wombatkv_config_from_runtime(
+    worker_id: WorkerId,
+    runtime_config: &ModelRuntimeConfig,
+) -> Option<WombatKvSharedCacheConfig> {
+    match runtime_config
+        .get_engine_specific::<WombatKvSharedCacheConfig>(WOMBATKV_SHARED_CACHE_RUNTIME_KEY)
+    {
+        Ok(Some(config)) => Some(config),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                worker_id,
+                runtime_key = WOMBATKV_SHARED_CACHE_RUNTIME_KEY,
+                %error,
+                "Failed to parse WombatKV shared-cache runtime config"
+            );
+            None
+        }
+    }
+}
+
+fn wombatkv_check_blocks_endpoint(config: &WombatKvSharedCacheConfig) -> Option<Url> {
+    let raw_endpoint = config.endpoint.as_deref()?;
+
+    let mut url = Url::parse(raw_endpoint)
+        .or_else(|_| Url::parse(&format!("http://{raw_endpoint}")))
+        .inspect_err(|error| {
+            tracing::warn!(
+                endpoint = raw_endpoint,
+                %error,
+                "Failed to parse WombatKV shared-cache endpoint"
+            );
+        })
+        .ok()?;
+
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/check_blocks");
+    }
+
+    Some(url)
+}
+
+fn wombatkv_response_to_hits(response: WombatKvCheckBlocksResponse) -> SharedCacheHits {
+    if !response.hits.is_empty() {
+        return SharedCacheHits::from_hits(&response.hits);
+    }
+
+    let ranges = response
+        .ranges
+        .into_iter()
+        .chain(response.hit_ranges)
+        .filter_map(|range| {
+            let (start, end) = match range {
+                WombatKvHitRange::Array([start, end]) => (start, end),
+                WombatKvHitRange::Object { start, end } => (start, end),
+            };
+            (end > start).then_some(start..end)
+        })
+        .collect::<Vec<_>>();
+
+    SharedCacheHits::from_ranges(ranges)
 }
 
 fn mooncake_config_from_runtime(
@@ -437,6 +701,31 @@ mod tests {
         rx
     }
 
+    fn wombatkv_config(endpoint: Option<String>) -> WombatKvSharedCacheConfig {
+        WombatKvSharedCacheConfig {
+            backend: "wombatkv".to_string(),
+            block_size: 4,
+            endpoint,
+            namespace: Some("default".to_string()),
+            model_fingerprint: Some("model-fp".to_string()),
+            layout_fingerprint: Some("layout-fp".to_string()),
+            timeout_ms: Some(250),
+        }
+    }
+
+    fn runtime_watch_with_wombatkv_config(config: WombatKvSharedCacheConfig) -> RuntimeConfigWatch {
+        let mut runtime_config = ModelRuntimeConfig::new();
+        runtime_config
+            .set_engine_specific(WOMBATKV_SHARED_CACHE_RUNTIME_KEY, config)
+            .unwrap();
+
+        let mut workers = HashMap::new();
+        workers.insert(1, runtime_config);
+
+        let (_tx, rx) = watch::channel(workers);
+        rx
+    }
+
     #[test]
     fn test_logical_page_hashes_match_sglang_for_normal_tokens() {
         let hashes = logical_page_hashes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 4, false);
@@ -567,5 +856,93 @@ mod tests {
         assert_eq!(hits.total_hits, 1);
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_wombatkv_check_blocks_posts_tokens_and_uses_ranges() {
+        let mut server = Server::new_async().await;
+
+        let response = json!({
+            "success": true,
+            "ranges": [[0, 2]],
+            "hit_ranges": [{"start": 4, "end": 5}]
+        });
+
+        let mock = server
+            .mock("POST", "/check_blocks")
+            .match_body(Matcher::PartialJson(json!({
+                "tokens": [10, 20, 30, 40, 50],
+                "block_size": 4,
+                "namespace": "default",
+                "model_fingerprint": "model-fp",
+                "layout_fingerprint": "layout-fp"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+
+        let cache = WombatKvSharedCache::new(runtime_watch_with_wombatkv_config(wombatkv_config(
+            Some(server.url()),
+        )));
+        let hits = cache.check_blocks(&[10, 20, 30, 40, 50], 4).await.unwrap();
+
+        assert_eq!(hits.ranges, vec![Range { start: 0, end: 2 }, 4..5]);
+        assert_eq!(hits.total_hits, 3);
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_wombatkv_check_blocks_uses_boolean_hits() {
+        let mut server = Server::new_async().await;
+
+        let response = json!({
+            "success": true,
+            "hits": [true, false, true, true]
+        });
+
+        let mock = server
+            .mock("POST", "/custom_check")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+
+        let cache = WombatKvSharedCache::new(runtime_watch_with_wombatkv_config(wombatkv_config(
+            Some(format!("{}/custom_check", server.url())),
+        )));
+        let hits = cache.check_blocks(&[1, 2, 3, 4], 4).await.unwrap();
+
+        assert_eq!(hits.ranges, vec![0..1, 2..4]);
+        assert_eq!(hits.total_hits, 3);
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_wombatkv_missing_runtime_config_is_empty() {
+        let workers = HashMap::new();
+        let (_tx, rx) = watch::channel(workers);
+        let cache = WombatKvSharedCache::new(rx);
+
+        let hits = cache.check_blocks(&[1, 2, 3, 4], 4).await.unwrap();
+
+        assert!(hits.ranges.is_empty());
+        assert_eq!(hits.total_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_wombatkv_block_size_mismatch_is_empty() {
+        let cache = WombatKvSharedCache::new(runtime_watch_with_wombatkv_config(wombatkv_config(
+            Some("http://127.0.0.1:1".to_string()),
+        )));
+
+        let hits = cache.check_blocks(&[1, 2, 3, 4], 8).await.unwrap();
+
+        assert!(hits.ranges.is_empty());
+        assert_eq!(hits.total_hits, 0);
     }
 }

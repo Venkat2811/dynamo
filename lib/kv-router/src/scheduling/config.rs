@@ -52,6 +52,8 @@ pub enum SharedCacheType {
     None,
     /// HiCache L3 shared cache — queries sglang workers via the request plane.
     Hicache,
+    /// WombatKV/TensorPuffer shared cache — queries the first-party cache service.
+    WombatKv,
 }
 
 impl fmt::Display for SharedCacheType {
@@ -59,6 +61,7 @@ impl fmt::Display for SharedCacheType {
         match self {
             Self::None => f.write_str("none"),
             Self::Hicache => f.write_str("hicache"),
+            Self::WombatKv => f.write_str("wombatkv"),
         }
     }
 }
@@ -70,8 +73,9 @@ impl FromStr for SharedCacheType {
         match s {
             "none" => Ok(Self::None),
             "hicache" => Ok(Self::Hicache),
+            "wombatkv" | "tensorpuffer" => Ok(Self::WombatKv),
             _ => Err(format!(
-                "unknown shared_cache_type: {s:?}, expected 'none' or 'hicache'"
+                "unknown shared_cache_type: {s:?}, expected 'none', 'hicache', or 'wombatkv'"
             )),
         }
     }
@@ -516,5 +520,26 @@ mod tests {
     #[test]
     fn test_kv_router_config_default_shared_cache_multiplier_is_disabled() {
         assert_eq!(KvRouterConfig::default().shared_cache_multiplier, 0.0);
+    }
+
+    #[test]
+    fn test_shared_cache_type_parse_and_display() {
+        assert_eq!(
+            "none".parse::<SharedCacheType>().unwrap(),
+            SharedCacheType::None
+        );
+        assert_eq!(
+            "hicache".parse::<SharedCacheType>().unwrap(),
+            SharedCacheType::Hicache
+        );
+        assert_eq!(
+            "wombatkv".parse::<SharedCacheType>().unwrap(),
+            SharedCacheType::WombatKv
+        );
+        assert_eq!(
+            "tensorpuffer".parse::<SharedCacheType>().unwrap(),
+            SharedCacheType::WombatKv
+        );
+        assert_eq!(SharedCacheType::WombatKv.to_string(), "wombatkv");
     }
 }
