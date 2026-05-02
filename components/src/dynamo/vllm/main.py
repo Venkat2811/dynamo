@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -61,6 +62,8 @@ except ImportError:
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 shutdown_endpoints: list = []
+WOMBATKV_SHARED_CACHE_RUNTIME_KEY = "wombatkv_shared_cache"
+WOMBATKV_OFFLOAD_BACKENDS = {"tensorpuffer", "wombatkv"}
 
 
 def build_headless_namespace(config: Config) -> argparse.Namespace:
@@ -659,6 +662,19 @@ async def register_vllm_model(
     if stream_interval is not None:
         runtime_config.set_engine_specific("stream_interval", str(stream_interval))
 
+    wombatkv_runtime_data = get_wombatkv_shared_cache_runtime_data(
+        config, vllm_config, runtime_values
+    )
+    if wombatkv_runtime_data is not None:
+        runtime_config.set_engine_specific(
+            WOMBATKV_SHARED_CACHE_RUNTIME_KEY,
+            json.dumps(wombatkv_runtime_data, sort_keys=True),
+        )
+        logging.info(
+            "Published WombatKV shared-cache runtime metadata: %s",
+            wombatkv_runtime_data,
+        )
+
     # Get data_parallel_size from vllm_config (defaults to 1)
     dp_range = get_dp_range_for_worker(vllm_config)
     runtime_config.data_parallel_start_rank = dp_range[0]
@@ -698,6 +714,86 @@ async def register_vllm_model(
         media_decoder=media_decoder,
         media_fetcher=media_fetcher,
     )
+
+
+def get_wombatkv_shared_cache_runtime_data(
+    config: Config,
+    vllm_config: VllmConfig,
+    runtime_values: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build router-visible WombatKV runtime metadata for this worker.
+
+    Dynamo owns ModelRuntimeConfig publication, while vLLM owns the actual
+    OffloadingSpec. Publishing this small control-plane record lets the KV
+    router query WombatKV before selecting a worker without coupling Dynamo's
+    router to vLLM's in-process scheduler objects.
+    """
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    backend = str(getattr(cache_config, "kv_offloading_backend", "") or "")
+    offloading_size = getattr(cache_config, "kv_offloading_size", None)
+    if backend not in WOMBATKV_OFFLOAD_BACKENDS or offloading_size is None:
+        return None
+
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", {}) or {}
+
+    namespace = (
+        os.getenv("DYN_WOMBATKV_NAMESPACE")
+        or os.getenv("TPUF_KVBM_NAMESPACE")
+        or extra_config.get("namespace")
+        or extra_config.get("wombat_namespace")
+        or "vllm"
+    )
+    endpoint = (
+        os.getenv("DYN_WOMBATKV_SHARED_CACHE_ENDPOINT")
+        or os.getenv("TPUF_WOMBATKV_SHARED_CACHE_ENDPOINT")
+        or extra_config.get("wombatkv_shared_cache_endpoint")
+        or extra_config.get("shared_cache_endpoint")
+        or extra_config.get("control_endpoint")
+    )
+    timeout_ms = _optional_positive_int(
+        os.getenv("DYN_WOMBATKV_SHARED_CACHE_TIMEOUT_MS")
+        or extra_config.get("shared_cache_timeout_ms")
+        or extra_config.get("timeout_ms")
+    )
+
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+    pp_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
+    block_size = int(runtime_values["block_size"])
+    model_name = str(config.served_model_name or config.model)
+
+    runtime_data: dict[str, Any] = {
+        "backend": "wombatkv",
+        "block_size": block_size,
+        "namespace": str(namespace),
+        "model_fingerprint": str(
+            os.getenv("DYN_WOMBATKV_MODEL_FINGERPRINT")
+            or extra_config.get("model_fingerprint")
+            or model_name
+        ),
+        "layout_fingerprint": str(
+            os.getenv("DYN_WOMBATKV_LAYOUT_FINGERPRINT")
+            or extra_config.get("layout_fingerprint")
+            or f"vllm:{model_name}:tp={tp_size}:pp={pp_size}:block={block_size}"
+        ),
+    }
+    if endpoint:
+        runtime_data["endpoint"] = str(endpoint)
+    if timeout_ms is not None:
+        runtime_data["timeout_ms"] = timeout_ms
+
+    return runtime_data
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"expected a positive integer, got {value!r}")
+    return parsed
 
 
 def get_engine_cache_info(engine: AsyncLLM) -> dict[str, Any]:
