@@ -16,7 +16,8 @@
 //! 4. Queries the Mooncake master HTTP service directly via `/batch_query_keys`.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::Url;
@@ -25,6 +26,8 @@ use sha2::{Digest, Sha256};
 
 const MOONCAKE_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const WOMBATKV_HTTP_TIMEOUT: Duration = Duration::from_millis(250);
+const WOMBATKV_CIRCUIT_BREAKER_FAILURES: u32 = 3;
+const WOMBATKV_CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
 
 use dynamo_kv_router::{
     SharedKvCache,
@@ -106,6 +109,10 @@ struct WombatKvSharedCacheConfig {
     offload_block_tokens: Option<u32>,
     #[serde(default)]
     kv_cache_groups: Option<u32>,
+    #[serde(default)]
+    circuit_breaker_failures: Option<u32>,
+    #[serde(default)]
+    circuit_breaker_cooldown_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,6 +283,40 @@ impl HicacheSharedKvCache {
 pub struct WombatKvSharedCache {
     runtime_configs: RuntimeConfigWatch,
     http_client: reqwest::Client,
+    circuit_breaker: Mutex<WombatKvCircuitBreaker>,
+}
+
+#[derive(Debug, Default)]
+struct WombatKvCircuitBreaker {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+impl WombatKvCircuitBreaker {
+    fn is_open(&mut self, now: Instant) -> bool {
+        match self.open_until {
+            Some(open_until) if now < open_until => true,
+            Some(_) => {
+                self.open_until = None;
+                self.consecutive_failures = 0;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+
+    fn record_failure(&mut self, failure_threshold: u32, cooldown: Duration, now: Instant) -> bool {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= failure_threshold {
+            self.open_until = now.checked_add(cooldown);
+        }
+        self.open_until.is_some_and(|open_until| now < open_until)
+    }
 }
 
 impl WombatKvSharedCache {
@@ -286,6 +327,7 @@ impl WombatKvSharedCache {
                 .timeout(WOMBATKV_HTTP_TIMEOUT)
                 .build()
                 .expect("failed to build reqwest client"),
+            circuit_breaker: Mutex::new(WombatKvCircuitBreaker::default()),
         }
     }
 
@@ -310,6 +352,48 @@ impl WombatKvSharedCache {
         }
 
         Some(first.clone())
+    }
+
+    fn circuit_breaker_params(config: &WombatKvSharedCacheConfig) -> (u32, Duration) {
+        let failures = config
+            .circuit_breaker_failures
+            .unwrap_or(WOMBATKV_CIRCUIT_BREAKER_FAILURES)
+            .max(1);
+        let cooldown = config
+            .circuit_breaker_cooldown_ms
+            .map(Duration::from_millis)
+            .unwrap_or(WOMBATKV_CIRCUIT_BREAKER_COOLDOWN)
+            .max(Duration::from_millis(1));
+        (failures, cooldown)
+    }
+
+    fn circuit_breaker_is_open(&self) -> Option<u32> {
+        let mut breaker = self
+            .circuit_breaker
+            .lock()
+            .expect("WombatKV shared-cache circuit breaker lock poisoned");
+        let now = Instant::now();
+        breaker.is_open(now).then_some(breaker.consecutive_failures)
+    }
+
+    fn record_circuit_breaker_success(&self) {
+        self.circuit_breaker
+            .lock()
+            .expect("WombatKV shared-cache circuit breaker lock poisoned")
+            .record_success();
+    }
+
+    fn record_circuit_breaker_failure(
+        &self,
+        config: &WombatKvSharedCacheConfig,
+    ) -> (u32, bool, Duration) {
+        let (failure_threshold, cooldown) = Self::circuit_breaker_params(config);
+        let mut breaker = self
+            .circuit_breaker
+            .lock()
+            .expect("WombatKV shared-cache circuit breaker lock poisoned");
+        let is_open = breaker.record_failure(failure_threshold, cooldown, Instant::now());
+        (breaker.consecutive_failures, is_open, cooldown)
     }
 }
 
@@ -356,6 +440,15 @@ impl SharedKvCache for WombatKvSharedCache {
             return Ok(SharedCacheHits::default());
         };
 
+        if let Some(consecutive_failures) = self.circuit_breaker_is_open() {
+            tracing::warn!(
+                url = %endpoint,
+                consecutive_failures,
+                "WombatKV shared-cache circuit breaker is open; skipping lookup"
+            );
+            return Err(KvRouterError::IndexerOffline);
+        }
+
         let request = WombatKvCheckBlocksRequest {
             tokens,
             block_size,
@@ -380,39 +473,69 @@ impl SharedKvCache for WombatKvSharedCache {
             builder = builder.timeout(Duration::from_millis(timeout_ms));
         }
 
-        let response = builder.send().await.map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                url = %endpoint,
-                "WombatKV shared-cache check_blocks request failed"
-            );
-            KvRouterError::IndexerOffline
-        })?;
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let (consecutive_failures, circuit_open, cooldown) =
+                    self.record_circuit_breaker_failure(&config);
+                tracing::warn!(
+                    error = %error,
+                    url = %endpoint,
+                    consecutive_failures,
+                    circuit_open,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "WombatKV shared-cache check_blocks request failed"
+                );
+                return Err(KvRouterError::IndexerOffline);
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
+            let (consecutive_failures, circuit_open, cooldown) =
+                self.record_circuit_breaker_failure(&config);
             tracing::warn!(
                 status = %status,
                 url = %endpoint,
+                consecutive_failures,
+                circuit_open,
+                cooldown_ms = cooldown.as_millis() as u64,
                 "WombatKV shared-cache check_blocks returned non-success status"
             );
             return Err(KvRouterError::IndexerOffline);
         }
 
-        let body: WombatKvCheckBlocksResponse = response.json().await.map_err(|error| {
-            tracing::warn!(
-                error = %error,
-                url = %endpoint,
-                "Failed to decode WombatKV shared-cache check_blocks response"
-            );
-            KvRouterError::IndexerOffline
-        })?;
+        let body: WombatKvCheckBlocksResponse = match response.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                let (consecutive_failures, circuit_open, cooldown) =
+                    self.record_circuit_breaker_failure(&config);
+                tracing::warn!(
+                    error = %error,
+                    url = %endpoint,
+                    consecutive_failures,
+                    circuit_open,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "Failed to decode WombatKV shared-cache check_blocks response"
+                );
+                return Err(KvRouterError::IndexerOffline);
+            }
+        };
 
         if body.success == Some(false) {
-            tracing::warn!(url = %endpoint, "WombatKV shared-cache check_blocks reported failure");
+            let (consecutive_failures, circuit_open, cooldown) =
+                self.record_circuit_breaker_failure(&config);
+            tracing::warn!(
+                url = %endpoint,
+                consecutive_failures,
+                circuit_open,
+                cooldown_ms = cooldown.as_millis() as u64,
+                "WombatKV shared-cache check_blocks reported failure"
+            );
             return Err(KvRouterError::IndexerOffline);
         }
 
+        self.record_circuit_breaker_success();
         Ok(wombatkv_response_to_hits(body))
     }
 }
@@ -776,6 +899,8 @@ mod tests {
             gpu_block_tokens: Some(vec![4]),
             offload_block_tokens: Some(4),
             kv_cache_groups: Some(1),
+            circuit_breaker_failures: None,
+            circuit_breaker_cooldown_ms: None,
         }
     }
 
@@ -1010,5 +1135,29 @@ mod tests {
 
         assert!(hits.ranges.is_empty());
         assert_eq!(hits.total_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_wombatkv_circuit_breaker_opens_after_repeated_failures() {
+        let mut server = Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/check_blocks")
+            .expect(2)
+            .with_status(500)
+            .with_body("not available")
+            .create_async()
+            .await;
+
+        let mut config = wombatkv_config(Some(server.url()));
+        config.circuit_breaker_failures = Some(2);
+        config.circuit_breaker_cooldown_ms = Some(60_000);
+        let cache = WombatKvSharedCache::new(runtime_watch_with_wombatkv_config(config));
+
+        assert!(cache.check_blocks(&[1, 2, 3, 4], 4).await.is_err());
+        assert!(cache.check_blocks(&[1, 2, 3, 4], 4).await.is_err());
+        assert!(cache.check_blocks(&[1, 2, 3, 4], 4).await.is_err());
+
+        mock.assert_async().await;
     }
 }

@@ -757,6 +757,16 @@ def get_wombatkv_shared_cache_runtime_data(
         or extra_config.get("shared_cache_timeout_ms")
         or extra_config.get("timeout_ms")
     )
+    circuit_breaker_failures = _optional_positive_int(
+        os.getenv("DYN_WOMBATKV_SHARED_CACHE_FAILURE_THRESHOLD")
+        or extra_config.get("shared_cache_failure_threshold")
+        or extra_config.get("circuit_breaker_failures")
+    )
+    circuit_breaker_cooldown_ms = _optional_positive_int(
+        os.getenv("DYN_WOMBATKV_SHARED_CACHE_COOLDOWN_MS")
+        or extra_config.get("shared_cache_circuit_breaker_cooldown_ms")
+        or extra_config.get("circuit_breaker_cooldown_ms")
+    )
 
     parallel_config = getattr(vllm_config, "parallel_config", None)
     model_config = getattr(vllm_config, "model_config", None)
@@ -840,6 +850,10 @@ def get_wombatkv_shared_cache_runtime_data(
         runtime_data["endpoint"] = str(endpoint)
     if timeout_ms is not None:
         runtime_data["timeout_ms"] = timeout_ms
+    if circuit_breaker_failures is not None:
+        runtime_data["circuit_breaker_failures"] = circuit_breaker_failures
+    if circuit_breaker_cooldown_ms is not None:
+        runtime_data["circuit_breaker_cooldown_ms"] = circuit_breaker_cooldown_ms
 
     return runtime_data
 

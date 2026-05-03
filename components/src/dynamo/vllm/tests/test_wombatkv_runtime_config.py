@@ -80,6 +80,8 @@ def test_wombatkv_runtime_data_uses_extra_config():
                 "layout_fingerprint": "layout-digest",
                 "key_prefix": "custom/vllm",
                 "kv_cache_groups": "2",
+                "shared_cache_failure_threshold": "4",
+                "shared_cache_circuit_breaker_cooldown_ms": "1250",
             },
             tp_size=2,
         ),
@@ -103,6 +105,8 @@ def test_wombatkv_runtime_data_uses_extra_config():
         "gpu_block_tokens": [16],
         "offload_block_tokens": 16,
         "kv_cache_groups": 2,
+        "circuit_breaker_failures": 4,
+        "circuit_breaker_cooldown_ms": 1250,
     }
 
 
@@ -115,6 +119,8 @@ def test_wombatkv_runtime_data_env_overrides(monkeypatch):
     monkeypatch.setenv("DYN_WOMBATKV_DTYPE", "env-dtype")
     monkeypatch.setenv("DYN_WOMBATKV_KV_CACHE_GROUPS", "3")
     monkeypatch.setenv("DYN_WOMBATKV_GPU_BLOCK_TOKENS", "32")
+    monkeypatch.setenv("DYN_WOMBATKV_SHARED_CACHE_FAILURE_THRESHOLD", "5")
+    monkeypatch.setenv("DYN_WOMBATKV_SHARED_CACHE_COOLDOWN_MS", "2000")
     monkeypatch.setenv("PYTHONHASHSEED", "0")
 
     data = get_wombatkv_shared_cache_runtime_data(
@@ -140,4 +146,6 @@ def test_wombatkv_runtime_data_env_overrides(monkeypatch):
         "gpu_block_tokens": [32],
         "offload_block_tokens": 32,
         "kv_cache_groups": 3,
+        "circuit_breaker_failures": 5,
+        "circuit_breaker_cooldown_ms": 2000,
     }
