@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import logging
 import os
 
@@ -86,6 +87,39 @@ DECODED_VARIANT_KEY: Final = "Decoded"
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+
+def _wombatkv_timing_enabled() -> bool:
+    return os.environ.get("DYN_WOMBATKV_TIMING", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_wombatkv_timing(
+    *,
+    request_id: str,
+    stage: str,
+    start_s: float,
+    previous_s: float,
+    **fields: Any,
+) -> float:
+    now_s = time.perf_counter()
+    record = {
+        "event": "dynamo_wombatkv_timing",
+        "request_id": request_id,
+        "stage": stage,
+        "delta_ms": round((now_s - previous_s) * 1000.0, 3),
+        "elapsed_ms": round((now_s - start_s) * 1000.0, 3),
+    }
+    record.update(fields)
+    logger.info(
+        "[DynamoWombatKVTiming] %s",
+        json.dumps(record, sort_keys=True, default=str),
+    )
+    return now_s
 
 
 class _DeferredAbort:
@@ -1932,6 +1966,21 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         trace_headers=None,
         priority=0,
     ):
+        timing_enabled = _wombatkv_timing_enabled()
+        timing_start_s = timing_previous_s = time.perf_counter()
+        if timing_enabled:
+            prompt_kind = type(prompt).__name__
+            prompt_tokens = getattr(prompt, "prompt_token_ids", None)
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="generate_tokens_start",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                prompt_kind=prompt_kind,
+                prompt_tokens=len(prompt_tokens) if prompt_tokens is not None else None,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+            )
         try:
             # Log LoRA usage for this generation (debug level to avoid log spam)
             self._log_with_lora_context(
@@ -1948,10 +1997,28 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                 trace_headers=trace_headers,
                 priority=priority,
             )
+            if timing_enabled:
+                timing_previous_s = _log_wombatkv_timing(
+                    request_id=request_id,
+                    stage="engine_generate_created",
+                    start_s=timing_start_s,
+                    previous_s=timing_previous_s,
+                )
 
             num_output_tokens_so_far: dict[int, int] = {}
+            first_engine_result = True
+            first_worker_chunk = True
             async for res in gen:
                 # res is vllm's RequestOutput
+                if timing_enabled and first_engine_result:
+                    first_engine_result = False
+                    timing_previous_s = _log_wombatkv_timing(
+                        request_id=request_id,
+                        stage="engine_first_result",
+                        start_s=timing_start_s,
+                        previous_s=timing_previous_s,
+                        output_count=len(getattr(res, "outputs", []) or []),
+                    )
 
                 if not res.outputs:
                     self._log_with_lora_context(
@@ -2008,6 +2075,27 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                         )
                     if output.stop_reason:
                         out["stop_reason"] = output.stop_reason
+                    if timing_enabled and first_worker_chunk:
+                        first_worker_chunk = False
+                        timing_previous_s = _log_wombatkv_timing(
+                            request_id=request_id,
+                            stage="worker_first_chunk",
+                            start_s=timing_start_s,
+                            previous_s=timing_previous_s,
+                            output_index=output_idx,
+                            new_token_count=len(out["token_ids"]),
+                            finish_reason=out.get("finish_reason"),
+                        )
+                    if timing_enabled and output.finish_reason:
+                        timing_previous_s = _log_wombatkv_timing(
+                            request_id=request_id,
+                            stage="worker_finish_chunk",
+                            start_s=timing_start_s,
+                            previous_s=timing_previous_s,
+                            output_index=output_idx,
+                            total_output_tokens=next_total_toks,
+                            finish_reason=out.get("finish_reason"),
+                        )
                     yield out
                     num_output_tokens_so_far[output_idx] = next_total_toks
 
@@ -2054,24 +2142,74 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         request_id = context.id()
         logger.debug(f"Decode Request ID: {request_id}")
         first_token = True
+        timing_enabled = _wombatkv_timing_enabled()
+        timing_start_s = timing_previous_s = time.perf_counter()
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="decode_generate_start",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                request_keys=sorted(request.keys()) if isinstance(request, dict) else [],
+                use_vllm_tokenizer=self.use_vllm_tokenizer,
+            )
         with time_and_log_code_section(
             f"[DECODE] request: {request_id} generate"
         ) as decode_timer:
             if self.use_vllm_tokenizer:
                 # Text-in-text-out mode: use InputParamManager and OpenAI-compatible format
                 generator = self._generate_text_mode(request, context, request_id)
+                mode = "text"
             else:
                 # Token-in-token-out mode: internal protocol format
                 generator = self._generate_token_mode(request, context, request_id)
+                mode = "token"
+
+            if timing_enabled:
+                timing_previous_s = _log_wombatkv_timing(
+                    request_id=request_id,
+                    stage="decode_generator_selected",
+                    start_s=timing_start_s,
+                    previous_s=timing_previous_s,
+                    mode=mode,
+                )
 
             async for chunk in generator:
                 if first_token:
                     decode_timer.stop_interval()
                     first_token = False
+                    if timing_enabled:
+                        timing_previous_s = _log_wombatkv_timing(
+                            request_id=request_id,
+                            stage="decode_first_yield",
+                            start_s=timing_start_s,
+                            previous_s=timing_previous_s,
+                            chunk_keys=sorted(chunk.keys())
+                            if isinstance(chunk, dict)
+                            else [],
+                        )
                 yield chunk
+            if timing_enabled:
+                _log_wombatkv_timing(
+                    request_id=request_id,
+                    stage="decode_generate_done",
+                    start_s=timing_start_s,
+                    previous_s=timing_previous_s,
+                )
 
     async def _generate_token_mode(self, request, context, request_id):
         """Generate tokens using internal protocol format (token-in-token-out)."""
+        timing_enabled = _wombatkv_timing_enabled()
+        timing_start_s = timing_previous_s = time.perf_counter()
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="token_mode_start",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                token_count=len(request.get("token_ids") or []),
+                has_prefill_result=bool(request.get("prefill_result")),
+            )
         # Firstly extract disaggregated params from prefill result if available
         prefill_result = request.get("prefill_result")
         if prefill_result and isinstance(prefill_result, dict):
@@ -2087,6 +2225,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         else:
             kv_params = None
             embedding_params = None
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="token_mode_prefill_params",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                has_kv_params=kv_params is not None,
+                has_embedding_params=embedding_params is not None,
+            )
 
         is_decode_only = self.config.disaggregation_mode == DisaggregationMode.DECODE
         has_mm_data = (
@@ -2160,6 +2307,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     context,
                     mm_processor_kwargs=mm_processor_kwargs,
                 )
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="token_mode_mm_ready",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                is_decode_only=is_decode_only,
+                has_mm_data=has_mm_data,
+                has_pre_rendered=pre_rendered is not None,
+            )
 
         # Build prompt from request. `prompt` is either a pre-rendered
         # MultiModalInput dict (fast path) or a TokensPrompt/EmbedsPrompt from
@@ -2189,6 +2346,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     multi_modal_data,
                     mm_processor_kwargs=mm_processor_kwargs,
                 )
+        if timing_enabled:
+            prompt_tokens = getattr(prompt, "prompt_token_ids", None)
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="token_mode_prompt_built",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                prompt_kind=type(prompt).__name__,
+                prompt_tokens=len(prompt_tokens) if prompt_tokens is not None else None,
+            )
         if error is not None:
             yield error
             return
@@ -2197,6 +2364,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         sampling_params = build_sampling_params(
             request, self.default_sampling_params, self.model_max_len
         )
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="token_mode_sampling_params",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                max_tokens=getattr(sampling_params, "max_tokens", None),
+                temperature=getattr(sampling_params, "temperature", None),
+            )
 
         if kv_params is not None:
             if sampling_params.extra_args is None:
@@ -2225,6 +2401,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         priority = -int(routing.get("priority", 0))
 
         trace_headers = build_trace_headers(context)
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="token_mode_before_engine",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                data_parallel_rank=dp_rank,
+                priority=priority,
+                has_lora=lora_request is not None,
+            )
 
         # In disagg decode mode, defer engine_client.abort() until the first
         # token so we don't abort while a NIXL KV transfer is still in flight
@@ -2255,6 +2441,19 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             tok["completion_usage"][
                                 "prompt_tokens_details"
                             ] = prefill_prompt_tokens_details
+                        if timing_enabled:
+                            timing_previous_s = _log_wombatkv_timing(
+                                request_id=request_id,
+                                stage="token_mode_yield_chunk",
+                                start_s=timing_start_s,
+                                previous_s=timing_previous_s,
+                                chunk_keys=sorted(tok.keys())
+                                if isinstance(tok, dict)
+                                else [],
+                                finish_reason=tok.get("finish_reason")
+                                if isinstance(tok, dict)
+                                else None,
+                            )
                         yield tok
                 except EngineDeadError as e:
                     logger.error(f"vLLM EngineDeadError: {e}")
@@ -2264,10 +2463,29 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
     async def _generate_text_mode(self, request, context, request_id):
         """Generate text using OpenAI-compatible format (text-in-text-out)."""
+        timing_enabled = _wombatkv_timing_enabled()
+        timing_start_s = timing_previous_s = time.perf_counter()
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="text_mode_start",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                request_keys=sorted(request.keys()) if isinstance(request, dict) else [],
+            )
         # Get text input using InputParamManager
         input_data = self.input_param_manager.get_input_param(
             request, use_tokenizer=True
         )
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="text_mode_input_param",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                input_kind=type(input_data).__name__,
+                token_count=len(input_data) if isinstance(input_data, list) else None,
+            )
 
         # Build prompt for vLLM
         if isinstance(input_data, list):
@@ -2279,6 +2497,15 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         sampling_params = build_sampling_params_openai(
             request, self.default_sampling_params
         )
+        if timing_enabled:
+            timing_previous_s = _log_wombatkv_timing(
+                request_id=request_id,
+                stage="text_mode_sampling_params",
+                start_s=timing_start_s,
+                previous_s=timing_previous_s,
+                prompt_kind=type(prompt).__name__,
+                max_tokens=getattr(sampling_params, "max_tokens", None),
+            )
 
         routing = request.get("routing") or {}
         dp_rank = self._to_local_dp_rank(routing.get("dp_rank"))
@@ -2298,8 +2525,28 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     trace_headers=trace_headers,
                     priority=priority,
                 )
+                if timing_enabled:
+                    timing_previous_s = _log_wombatkv_timing(
+                        request_id=request_id,
+                        stage="text_mode_engine_generate_created",
+                        start_s=timing_start_s,
+                        previous_s=timing_previous_s,
+                        data_parallel_rank=dp_rank,
+                        priority=priority,
+                    )
 
+                first_engine_result = True
+                first_worker_chunk = True
                 async for res in gen:
+                    if timing_enabled and first_engine_result:
+                        first_engine_result = False
+                        timing_previous_s = _log_wombatkv_timing(
+                            request_id=request_id,
+                            stage="text_mode_engine_first_result",
+                            start_s=timing_start_s,
+                            previous_s=timing_previous_s,
+                            output_count=len(getattr(res, "outputs", []) or []),
+                        )
                     if not res.outputs:
                         yield {
                             "id": openai_request_id,
@@ -2344,6 +2591,25 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         if output.finish_reason:
                             chunk["usage"] = BaseWorkerHandler._build_completion_usage(
                                 request_output=res,
+                            )
+                        if timing_enabled and first_worker_chunk:
+                            first_worker_chunk = False
+                            timing_previous_s = _log_wombatkv_timing(
+                                request_id=request_id,
+                                stage="text_mode_worker_first_chunk",
+                                start_s=timing_start_s,
+                                previous_s=timing_previous_s,
+                                output_index=output_idx,
+                                finish_reason=choice_data.get("finish_reason"),
+                            )
+                        if timing_enabled and output.finish_reason:
+                            timing_previous_s = _log_wombatkv_timing(
+                                request_id=request_id,
+                                stage="text_mode_worker_finish_chunk",
+                                start_s=timing_start_s,
+                                previous_s=timing_previous_s,
+                                output_index=output_idx,
+                                finish_reason=choice_data.get("finish_reason"),
                             )
 
                         yield chunk
