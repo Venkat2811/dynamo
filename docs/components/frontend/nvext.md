@@ -89,6 +89,7 @@ The `agent_hints` sub-object carries per-request hints that the router uses for 
 |-------|------|---------|-------------|
 | `priority` | `i32` | `None` | Unified request priority. Higher values mean higher priority at the Dynamo API level. Used for router queue ordering and backend scheduling/eviction. |
 | `osl` | `u32` | `None` | Expected output sequence length (tokens). Used for output block tracking and resource estimation. |
+| `shared_cache_multiplier` | `f64` | Router default | Per-request multiplier for external shared KV cache hits. Range: `0.0`-`1.0`. |
 | `speculative_prefill` | `bool` | `false` | When `true`, speculatively prefills the predicted next-turn prompt after the current turn completes to warm the KV cache. |
 
 ### `priority`
@@ -119,6 +120,32 @@ Expected output sequence length — the estimated number of output tokens the re
     "nvext": {
         "agent_hints": {
             "osl": 1024
+        }
+    }
+}
+```
+
+### `shared_cache_multiplier`
+
+Per-request routing weight for external shared KV cache hits such as WombatKV.
+This overrides the router's global `shared_cache_multiplier` only for the
+current request.
+
+Use this when a gateway or agent runtime knows that shared-cache reads are
+valuable for a request family and wants the KV router to prefer workers whose
+device-local prefix plus WombatKV-covered prefix minimizes prefill work.
+
+The value must be between `0.0` and `1.0`:
+
+- `0.0`: ignore shared-cache hits for routing
+- `0.5`: count each shared-cache block as half of a device-local block
+- `1.0`: count shared-cache hits as equal to device-local hits
+
+```json
+{
+    "nvext": {
+        "agent_hints": {
+            "shared_cache_multiplier": 0.5
         }
     }
 }

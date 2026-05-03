@@ -365,6 +365,13 @@ pub struct AgentHints {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub osl: Option<u32>,
 
+    /// Per-request multiplier for external shared KV cache hits.
+    /// Range: 0.0-1.0. A value of 0.0 disables shared-cache routing influence
+    /// for this request; 1.0 treats shared-cache hits as equal to device-local hits.
+    #[builder(default, setter(strip_option))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_cache_multiplier: Option<f64>,
+
     /// When true, after the assistant turn completes, the system will speculatively
     /// prefill the predicted next-turn prefix (conversation history with thinking
     /// content stripped) on a worker to warm the KV cache for the next request.
@@ -437,7 +444,18 @@ impl NvExt {
     }
 }
 
-fn validate_nv_ext(_nv_ext: &NvExt) -> Result<(), ValidationError> {
+fn validate_nv_ext(nv_ext: &NvExt) -> Result<(), ValidationError> {
+    if let Some(shared_cache_multiplier) = nv_ext
+        .agent_hints
+        .as_ref()
+        .and_then(|hints| hints.shared_cache_multiplier)
+        && !(0.0..=1.0).contains(&shared_cache_multiplier)
+    {
+        return Err(ValidationError::new(
+            "agent_hints_shared_cache_multiplier_range",
+        ));
+    }
+
     Ok(())
 }
 
@@ -498,6 +516,27 @@ mod tests {
         assert_eq!(nv_ext.extra_fields, Some(vec!["worker_id".to_string()]));
         // Validate the built struct
         assert!(nv_ext.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_hints_shared_cache_multiplier_validation() {
+        let valid = NvExt::builder()
+            .agent_hints(AgentHints {
+                shared_cache_multiplier: Some(0.5),
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        assert!(valid.validate().is_ok());
+
+        let invalid = NvExt::builder()
+            .agent_hints(AgentHints {
+                shared_cache_multiplier: Some(1.5),
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     // Test GAIE Stage 2 disaggregated worker IDs

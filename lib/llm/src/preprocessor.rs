@@ -353,6 +353,14 @@ impl OpenAIPreprocessor {
                 session_control: nvext.session_control.clone(),
             };
             builder.routing(Some(routing));
+            if let Some(shared_cache_multiplier) = hints.and_then(|h| h.shared_cache_multiplier) {
+                builder.router_config_override(Some(
+                    dynamo_kv_router::config::RouterConfigOverride {
+                        shared_cache_multiplier: Some(shared_cache_multiplier),
+                        ..Default::default()
+                    },
+                ));
+            }
         } else if lora_name.is_some() {
             // Ensure routing hints exist when we have LoRA,
             // even when nvext is absent.
