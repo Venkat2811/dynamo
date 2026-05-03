@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
@@ -19,7 +20,10 @@ use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use libloading::Library;
 
-use crate::object::{DefaultKeyFormatter, KeyFormatter, LayoutConfigExt, ObjectBlockOps};
+use crate::object::{
+    DefaultKeyFormatter, KeyFormatter, LayoutConfigExt, LockFileContent, ObjectBlockOps,
+    ObjectLockManager,
+};
 use crate::{BlockId, SequenceHash};
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_physical::transfer::PhysicalLayout;
@@ -32,6 +36,8 @@ type TpufFree = unsafe extern "C" fn(*mut TpufHandle);
 type TpufLastError = unsafe extern "C" fn() -> *const c_char;
 type TpufPutKv =
     unsafe extern "C" fn(*mut TpufHandle, *const c_char, *const c_char, *const u8, usize) -> i64;
+type TpufPutKvIfAbsent =
+    unsafe extern "C" fn(*mut TpufHandle, *const c_char, *const c_char, *const u8, usize) -> i32;
 type TpufGetKvBorrowed = unsafe extern "C" fn(
     *mut TpufHandle,
     *const c_char,
@@ -40,8 +46,28 @@ type TpufGetKvBorrowed = unsafe extern "C" fn(
     *mut usize,
     *mut *mut TpufBorrow,
 ) -> i32;
+type TpufGetKvWithTokenBorrowed = unsafe extern "C" fn(
+    *mut TpufHandle,
+    *const c_char,
+    *const c_char,
+    *mut *const u8,
+    *mut usize,
+    *mut *const u8,
+    *mut usize,
+    *mut *mut TpufBorrow,
+) -> i32;
+type TpufPutKvIfTokenMatches = unsafe extern "C" fn(
+    *mut TpufHandle,
+    *const c_char,
+    *const c_char,
+    *const u8,
+    usize,
+    *const u8,
+    usize,
+) -> i32;
 type TpufReleaseBorrow = unsafe extern "C" fn(*mut TpufBorrow);
 type TpufExistsKv = unsafe extern "C" fn(*mut TpufHandle, *const c_char, *const c_char) -> i32;
+type TpufDeleteKv = unsafe extern "C" fn(*mut TpufHandle, *const c_char, *const c_char) -> i32;
 type TpufRestoreNamespace = unsafe extern "C" fn(*mut TpufHandle, *const c_char) -> i64;
 
 struct TensorPufferAbi {
@@ -49,9 +75,13 @@ struct TensorPufferAbi {
     tpuf_free: TpufFree,
     tpuf_last_error: TpufLastError,
     tpuf_put_kv: TpufPutKv,
+    tpuf_put_kv_if_absent: Option<TpufPutKvIfAbsent>,
     tpuf_get_kv_borrowed: TpufGetKvBorrowed,
+    tpuf_get_kv_with_token_borrowed: Option<TpufGetKvWithTokenBorrowed>,
+    tpuf_put_kv_if_token_matches: Option<TpufPutKvIfTokenMatches>,
     tpuf_release_borrow: TpufReleaseBorrow,
     tpuf_exists_kv: TpufExistsKv,
+    tpuf_delete_kv: Option<TpufDeleteKv>,
     tpuf_restore_namespace: TpufRestoreNamespace,
 }
 
@@ -81,9 +111,17 @@ impl TensorPufferAbi {
             tpuf_free: unsafe { load_symbol(&lib, b"tpuf_free")? },
             tpuf_last_error: unsafe { load_symbol(&lib, b"tpuf_last_error")? },
             tpuf_put_kv: unsafe { load_symbol(&lib, b"tpuf_put_kv")? },
+            tpuf_put_kv_if_absent: unsafe { load_optional_symbol(&lib, b"tpuf_put_kv_if_absent")? },
             tpuf_get_kv_borrowed: unsafe { load_symbol(&lib, b"tpuf_get_kv_borrowed")? },
+            tpuf_get_kv_with_token_borrowed: unsafe {
+                load_optional_symbol(&lib, b"tpuf_get_kv_with_token_borrowed")?
+            },
+            tpuf_put_kv_if_token_matches: unsafe {
+                load_optional_symbol(&lib, b"tpuf_put_kv_if_token_matches")?
+            },
             tpuf_release_borrow: unsafe { load_symbol(&lib, b"tpuf_release_borrow")? },
             tpuf_exists_kv: unsafe { load_symbol(&lib, b"tpuf_exists_kv")? },
+            tpuf_delete_kv: unsafe { load_optional_symbol(&lib, b"tpuf_delete_kv")? },
             tpuf_restore_namespace: unsafe { load_symbol(&lib, b"tpuf_restore_namespace")? },
             _lib: lib,
         });
@@ -112,6 +150,13 @@ unsafe fn load_symbol<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
     let symbol = unsafe { lib.get::<T>(name) }
         .map_err(|e| anyhow!("failed to load TensorPuffer symbol {:?}: {e}", name))?;
     Ok(*symbol)
+}
+
+unsafe fn load_optional_symbol<T: Copy>(lib: &Library, name: &[u8]) -> Result<Option<T>> {
+    match unsafe { lib.get::<T>(name) } {
+        Ok(symbol) => Ok(Some(*symbol)),
+        Err(_) => Ok(None),
+    }
 }
 
 struct TensorPufferHandle {
@@ -156,6 +201,36 @@ impl TensorPufferHandle {
         Ok(rc as usize)
     }
 
+    fn put_kv_if_absent(&self, namespace: &str, key: &str, payload: &[u8]) -> Result<bool> {
+        let Some(tpuf_put_kv_if_absent) = self.abi.tpuf_put_kv_if_absent else {
+            anyhow::bail!("libtensorpuffer lacks tpuf_put_kv_if_absent; ABI 1.5+ required");
+        };
+        let namespace = cstring("namespace", namespace)?;
+        let key = cstring("key", key)?;
+        let payload_ptr = if payload.is_empty() {
+            NonNull::<u8>::dangling().as_ptr() as *const u8
+        } else {
+            payload.as_ptr()
+        };
+
+        let rc = unsafe {
+            tpuf_put_kv_if_absent(
+                self.handle.as_ptr(),
+                namespace.as_ptr(),
+                key.as_ptr(),
+                payload_ptr,
+                payload.len(),
+            )
+        };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            -2 => anyhow::bail!("TensorPuffer backend does not support conditional create"),
+            _ if rc < 0 => anyhow::bail!("{}", self.abi.last_error("tpuf_put_kv_if_absent failed")),
+            _ => anyhow::bail!("tpuf_put_kv_if_absent returned unexpected code {rc}"),
+        }
+    }
+
     fn get_kv(&self, namespace: &str, key: &str) -> Result<Option<Bytes>> {
         let namespace = cstring("namespace", namespace)?;
         let key = cstring("key", key)?;
@@ -194,6 +269,110 @@ impl TensorPufferHandle {
         Ok(Some(bytes))
     }
 
+    fn get_kv_with_token(&self, namespace: &str, key: &str) -> Result<Option<(Bytes, Bytes)>> {
+        let Some(tpuf_get_kv_with_token_borrowed) = self.abi.tpuf_get_kv_with_token_borrowed else {
+            anyhow::bail!(
+                "libtensorpuffer lacks tpuf_get_kv_with_token_borrowed; ABI 1.5+ required"
+            );
+        };
+        let namespace = cstring("namespace", namespace)?;
+        let key = cstring("key", key)?;
+        let mut out_ptr: *const u8 = std::ptr::null();
+        let mut out_len: usize = 0;
+        let mut token_ptr: *const u8 = std::ptr::null();
+        let mut token_len: usize = 0;
+        let mut borrow: *mut TpufBorrow = std::ptr::null_mut();
+
+        let rc = unsafe {
+            tpuf_get_kv_with_token_borrowed(
+                self.handle.as_ptr(),
+                namespace.as_ptr(),
+                key.as_ptr(),
+                &mut out_ptr,
+                &mut out_len,
+                &mut token_ptr,
+                &mut token_len,
+                &mut borrow,
+            )
+        };
+
+        if rc == 0 {
+            return Ok(None);
+        }
+        if rc < 0 {
+            anyhow::bail!(
+                "{}",
+                self.abi
+                    .last_error("tpuf_get_kv_with_token_borrowed failed")
+            );
+        }
+
+        let data = if out_len == 0 {
+            Bytes::new()
+        } else if out_ptr.is_null() {
+            unsafe { (self.abi.tpuf_release_borrow)(borrow) };
+            anyhow::bail!("tpuf_get_kv_with_token_borrowed returned null payload pointer");
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
+            Bytes::copy_from_slice(slice)
+        };
+        let token = if token_len == 0 || token_ptr.is_null() {
+            unsafe { (self.abi.tpuf_release_borrow)(borrow) };
+            anyhow::bail!("tpuf_get_kv_with_token_borrowed returned empty/null token");
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(token_ptr, token_len) };
+            Bytes::copy_from_slice(slice)
+        };
+        unsafe { (self.abi.tpuf_release_borrow)(borrow) };
+        Ok(Some((data, token)))
+    }
+
+    fn put_kv_if_token_matches(
+        &self,
+        namespace: &str,
+        key: &str,
+        payload: &[u8],
+        token: &[u8],
+    ) -> Result<bool> {
+        let Some(tpuf_put_kv_if_token_matches) = self.abi.tpuf_put_kv_if_token_matches else {
+            anyhow::bail!("libtensorpuffer lacks tpuf_put_kv_if_token_matches; ABI 1.5+ required");
+        };
+        let namespace = cstring("namespace", namespace)?;
+        let key = cstring("key", key)?;
+        let payload_ptr = if payload.is_empty() {
+            NonNull::<u8>::dangling().as_ptr() as *const u8
+        } else {
+            payload.as_ptr()
+        };
+        let token_ptr = if token.is_empty() {
+            anyhow::bail!("TensorPuffer CAS token must not be empty");
+        } else {
+            token.as_ptr()
+        };
+
+        let rc = unsafe {
+            tpuf_put_kv_if_token_matches(
+                self.handle.as_ptr(),
+                namespace.as_ptr(),
+                key.as_ptr(),
+                payload_ptr,
+                payload.len(),
+                token_ptr,
+                token.len(),
+            )
+        };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            -2 => anyhow::bail!("TensorPuffer backend does not support conditional update"),
+            _ if rc < 0 => anyhow::bail!(
+                "{}",
+                self.abi.last_error("tpuf_put_kv_if_token_matches failed")
+            ),
+            _ => anyhow::bail!("tpuf_put_kv_if_token_matches returned unexpected code {rc}"),
+        }
+    }
+
     fn exists_kv(&self, namespace: &str, key: &str) -> Result<bool> {
         let namespace = cstring("namespace", namespace)?;
         let key = cstring("key", key)?;
@@ -204,6 +383,21 @@ impl TensorPufferHandle {
             anyhow::bail!("{}", self.abi.last_error("tpuf_exists_kv failed"));
         }
         Ok(rc == 1)
+    }
+
+    fn delete_kv(&self, namespace: &str, key: &str) -> Result<bool> {
+        let Some(tpuf_delete_kv) = self.abi.tpuf_delete_kv else {
+            anyhow::bail!("libtensorpuffer lacks tpuf_delete_kv; ABI 1.5+ required");
+        };
+        let namespace = cstring("namespace", namespace)?;
+        let key = cstring("key", key)?;
+        let rc = unsafe { tpuf_delete_kv(self.handle.as_ptr(), namespace.as_ptr(), key.as_ptr()) };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ if rc < 0 => anyhow::bail!("{}", self.abi.last_error("tpuf_delete_kv failed")),
+            _ => anyhow::bail!("tpuf_delete_kv returned unexpected code {rc}"),
+        }
     }
 
     fn restore_namespace(&self, namespace: &str) -> Result<usize> {
@@ -506,6 +700,240 @@ impl ObjectBlockOps for WombatKvObjectBlockClient {
     }
 }
 
+/// WombatKV-backed object lock manager.
+///
+/// Uses TensorPuffer ABI 1.5 conditional namespace/key operations:
+/// `put_if_absent` for first acquisition, `get_with_token` +
+/// `put_if_token_matches` for stale-lock takeover, and `delete` for release.
+pub struct WombatKvLockManager {
+    store: Arc<TensorPufferHandle>,
+    namespace: String,
+    key_prefix: Option<String>,
+    instance_id: String,
+    lock_timeout: Duration,
+}
+
+impl WombatKvLockManager {
+    /// Default lock timeout: 300 seconds (5 minutes).
+    pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(300);
+
+    pub fn new(config: kvbm_config::WombatKvObjectConfig, instance_id: String) -> Result<Self> {
+        let store = Arc::new(TensorPufferHandle::new(config.lib_path.as_deref())?);
+        if config.restore_on_init {
+            let restored = store.restore_namespace(&config.namespace)?;
+            tracing::info!(
+                namespace = %config.namespace,
+                restored,
+                "restored WombatKV namespace for KVBM lock manager"
+            );
+        }
+
+        Ok(Self {
+            store,
+            namespace: config.namespace,
+            key_prefix: config.key_prefix,
+            instance_id,
+            lock_timeout: Self::DEFAULT_LOCK_TIMEOUT,
+        })
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+
+    fn lock_key(&self, hash: &SequenceHash) -> String {
+        format_lock_or_meta_key(self.key_prefix.as_deref(), hash, "lock")
+    }
+
+    fn meta_key(&self, hash: &SequenceHash) -> String {
+        format_lock_or_meta_key(self.key_prefix.as_deref(), hash, "meta")
+    }
+
+    fn create_lock_content(&self) -> LockFileContent {
+        let now = chrono::Utc::now();
+        let deadline = now + chrono::Duration::from_std(self.lock_timeout).unwrap_or_default();
+        LockFileContent {
+            instance_id: self.instance_id.clone(),
+            acquired_at: now.to_rfc3339(),
+            deadline: deadline.to_rfc3339(),
+        }
+    }
+
+    fn is_lock_expired(lock: &LockFileContent) -> bool {
+        if let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(&lock.deadline) {
+            chrono::Utc::now() > deadline.with_timezone(&chrono::Utc)
+        } else {
+            true
+        }
+    }
+}
+
+impl ObjectLockManager for WombatKvLockManager {
+    fn has_meta(&self, hash: SequenceHash) -> BoxFuture<'static, Result<bool>> {
+        let store = self.store.clone();
+        let namespace = self.namespace.clone();
+        let meta_key = self.meta_key(&hash);
+
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || store.exists_kv(&namespace, &meta_key))
+                .await
+                .map_err(|e| anyhow!("WombatKV has_meta task failed: {e}"))?
+        })
+    }
+
+    fn try_acquire_lock(&self, hash: SequenceHash) -> BoxFuture<'static, Result<bool>> {
+        let store = self.store.clone();
+        let namespace = self.namespace.clone();
+        let lock_key = self.lock_key(&hash);
+        let lock_content = self.create_lock_content();
+        let our_instance_id = self.instance_id.clone();
+
+        Box::pin(async move {
+            let lock_data = serde_json::to_vec(&lock_content)
+                .map_err(|e| anyhow!("failed to serialize WombatKV lock content: {e}"))?;
+
+            let created = tokio::task::spawn_blocking({
+                let store = store.clone();
+                let namespace = namespace.clone();
+                let lock_key = lock_key.clone();
+                let lock_data = lock_data.clone();
+                move || store.put_kv_if_absent(&namespace, &lock_key, &lock_data)
+            })
+            .await
+            .map_err(|e| anyhow!("WombatKV put_if_absent task failed: {e}"))??;
+            if created {
+                tracing::debug!(lock_key = %lock_key, "Acquired WombatKV lock");
+                return Ok(true);
+            }
+
+            let existing = tokio::task::spawn_blocking({
+                let store = store.clone();
+                let namespace = namespace.clone();
+                let lock_key = lock_key.clone();
+                move || store.get_kv_with_token(&namespace, &lock_key)
+            })
+            .await
+            .map_err(|e| anyhow!("WombatKV get_with_token task failed: {e}"))??;
+
+            let Some((existing_data, token)) = existing else {
+                let retried = tokio::task::spawn_blocking({
+                    let store = store.clone();
+                    let namespace = namespace.clone();
+                    let lock_key = lock_key.clone();
+                    let lock_data = lock_data.clone();
+                    move || store.put_kv_if_absent(&namespace, &lock_key, &lock_data)
+                })
+                .await
+                .map_err(|e| anyhow!("WombatKV lock retry task failed: {e}"))??;
+                return Ok(retried);
+            };
+
+            match serde_json::from_slice::<LockFileContent>(&existing_data) {
+                Ok(existing_lock) if existing_lock.instance_id == our_instance_id => Ok(true),
+                Ok(existing_lock) if !Self::is_lock_expired(&existing_lock) => {
+                    tracing::debug!(
+                        lock_key = %lock_key,
+                        owner = %existing_lock.instance_id,
+                        deadline = %existing_lock.deadline,
+                        "WombatKV lock held by another instance"
+                    );
+                    Ok(false)
+                }
+                Ok(existing_lock) => {
+                    tracing::debug!(
+                        lock_key = %lock_key,
+                        old_instance = %existing_lock.instance_id,
+                        deadline = %existing_lock.deadline,
+                        "WombatKV lock expired, attempting token-match takeover"
+                    );
+                    let won = tokio::task::spawn_blocking({
+                        let store = store.clone();
+                        let namespace = namespace.clone();
+                        let lock_key = lock_key.clone();
+                        let lock_data = lock_data.clone();
+                        move || {
+                            store.put_kv_if_token_matches(&namespace, &lock_key, &lock_data, &token)
+                        }
+                    })
+                    .await
+                    .map_err(|e| anyhow!("WombatKV token-match takeover task failed: {e}"))??;
+                    Ok(won)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        lock_key = %lock_key,
+                        error = %e,
+                        "Malformed WombatKV lock file, attempting token-match overwrite"
+                    );
+                    let won = tokio::task::spawn_blocking({
+                        let store = store.clone();
+                        let namespace = namespace.clone();
+                        let lock_key = lock_key.clone();
+                        let lock_data = lock_data.clone();
+                        move || {
+                            store.put_kv_if_token_matches(&namespace, &lock_key, &lock_data, &token)
+                        }
+                    })
+                    .await
+                    .map_err(|e| anyhow!("WombatKV malformed-lock takeover task failed: {e}"))??;
+                    Ok(won)
+                }
+            }
+        })
+    }
+
+    fn create_meta(&self, hash: SequenceHash) -> BoxFuture<'static, Result<()>> {
+        let store = self.store.clone();
+        let namespace = self.namespace.clone();
+        let meta_key = self.meta_key(&hash);
+
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || store.put_kv(&namespace, &meta_key, &[]))
+                .await
+                .map_err(|e| anyhow!("WombatKV create_meta task failed: {e}"))??;
+            Ok(())
+        })
+    }
+
+    fn release_lock(&self, hash: SequenceHash) -> BoxFuture<'static, Result<()>> {
+        let store = self.store.clone();
+        let namespace = self.namespace.clone();
+        let lock_key = self.lock_key(&hash);
+        let our_instance_id = self.instance_id.clone();
+
+        Box::pin(async move {
+            let existing = tokio::task::spawn_blocking({
+                let store = store.clone();
+                let namespace = namespace.clone();
+                let lock_key = lock_key.clone();
+                move || store.get_kv_with_token(&namespace, &lock_key)
+            })
+            .await
+            .map_err(|e| anyhow!("WombatKV release get task failed: {e}"))??;
+
+            if let Some((existing_data, _token)) = existing {
+                if let Ok(existing_lock) = serde_json::from_slice::<LockFileContent>(&existing_data)
+                {
+                    if existing_lock.instance_id != our_instance_id {
+                        tracing::debug!(
+                            lock_key = %lock_key,
+                            owner = %existing_lock.instance_id,
+                            "Skipping WombatKV lock release for another owner"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
+            tokio::task::spawn_blocking(move || store.delete_kv(&namespace, &lock_key))
+                .await
+                .map_err(|e| anyhow!("WombatKV release delete task failed: {e}"))??;
+            Ok(())
+        })
+    }
+}
+
 fn format_wombatkv_key(
     formatter: &dyn KeyFormatter,
     key_prefix: Option<&str>,
@@ -515,6 +943,14 @@ fn format_wombatkv_key(
     match key_prefix.filter(|prefix| !prefix.is_empty()) {
         Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), formatted),
         None => formatted,
+    }
+}
+
+fn format_lock_or_meta_key(key_prefix: Option<&str>, hash: &SequenceHash, suffix: &str) -> String {
+    let key = format!("{hash}.{suffix}");
+    match key_prefix.filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), key),
+        None => key,
     }
 }
 
@@ -629,11 +1065,25 @@ mod tests {
         assert!(key.starts_with("g4/3/"));
         assert!(key.ends_with(&hash.to_string()));
     }
+
+    #[test]
+    fn test_format_lock_or_meta_key_uses_shared_prefix_without_rank() {
+        let hash = SequenceHash::new(0x1234_u64, None, 7);
+        assert_eq!(
+            format_lock_or_meta_key(Some("g4/"), &hash, "lock"),
+            format!("g4/{}.lock", hash)
+        );
+        assert_eq!(
+            format_lock_or_meta_key(None, &hash, "meta"),
+            format!("{}.meta", hash)
+        );
+    }
 }
 
 #[cfg(all(test, feature = "testing"))]
 mod live_tests {
     use super::*;
+    use crate::object::ObjectLockManager;
     use kvbm_physical::testing::{create_fc_layout, create_test_agent};
     use kvbm_physical::transfer::StorageKind;
 
@@ -677,6 +1127,72 @@ mod live_tests {
             .expect("get raw WombatKV payload")
             .expect("payload should exist");
         assert_eq!(actual.as_ref(), &payload[..]);
+
+        let lock_key = format!("raw-lock/{}/{}", std::process::id(), uuid::Uuid::new_v4());
+        let lock_a = b"owner-a".to_vec();
+        assert!(
+            store
+                .put_kv_if_absent(&namespace, &lock_key, &lock_a)
+                .expect("conditional create")
+        );
+        assert!(
+            !store
+                .put_kv_if_absent(&namespace, &lock_key, b"owner-b")
+                .expect("conditional conflict")
+        );
+        let (current, token) = store
+            .get_kv_with_token(&namespace, &lock_key)
+            .expect("get with token")
+            .expect("lock present");
+        assert_eq!(current.as_ref(), &lock_a[..]);
+        assert!(
+            store
+                .put_kv_if_token_matches(&namespace, &lock_key, b"owner-c", &token)
+                .expect("token-match update")
+        );
+        assert!(store.delete_kv(&namespace, &lock_key).expect("delete lock"));
+        assert!(
+            !store
+                .exists_kv(&namespace, &lock_key)
+                .expect("exists after delete")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_wombatkv_lock_manager_create_meta_and_takeover() {
+        if !live_enabled() {
+            eprintln!("skipping live WombatKV test; set TPUF_LIVE_WOMBATKV=1");
+            return;
+        }
+
+        let run_id = format!("lock-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let namespace = std::env::var("KVBM_TEST_WOMBATKV_NAMESPACE")
+            .unwrap_or_else(|_| "kvbm-live-test".to_string());
+        let config = kvbm_config::WombatKvObjectConfig {
+            namespace,
+            key_prefix: Some(run_id),
+            lib_path: test_lib_path(),
+            max_concurrent_requests: 2,
+            restore_on_init: false,
+        };
+        let hash = SequenceHash::new(0xA11C_E5ED_u64, None, 21);
+        let manager_a = WombatKvLockManager::new(config.clone(), "instance-a".to_string())
+            .expect("manager a")
+            .with_timeout(Duration::from_millis(1));
+        let manager_b =
+            WombatKvLockManager::new(config, "instance-b".to_string()).expect("manager b");
+
+        assert!(manager_a.try_acquire_lock(hash).await.expect("a acquire"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            manager_b
+                .try_acquire_lock(hash)
+                .await
+                .expect("b expired-lock takeover")
+        );
+        manager_b.create_meta(hash).await.expect("create meta");
+        assert!(manager_b.has_meta(hash).await.expect("has meta"));
+        manager_b.release_lock(hash).await.expect("release");
     }
 
     #[tokio::test]

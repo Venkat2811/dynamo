@@ -2,4 +2,4 @@
 
 mod client;
 
-pub use client::WombatKvObjectBlockClient;
+pub use client::{WombatKvLockManager, WombatKvObjectBlockClient};

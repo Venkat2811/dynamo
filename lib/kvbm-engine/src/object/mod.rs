@@ -419,11 +419,19 @@ pub async fn create_lock_manager(
         kvbm_config::ObjectClientConfig::Nixl(_nixl_config) => {
             anyhow::bail!("Nixl object storage backend not yet implemented")
         }
-        kvbm_config::ObjectClientConfig::WombatKv(_wombat_config) => {
-            let _ = instance_id;
-            anyhow::bail!(
-                "WombatKV object lock manager requires a TensorPuffer conditional-put/CAS API"
-            )
+        kvbm_config::ObjectClientConfig::WombatKv(wombat_config) => {
+            #[cfg(feature = "wombatkv")]
+            {
+                let manager =
+                    wombatkv::WombatKvLockManager::new(wombat_config.clone(), instance_id)?;
+                Ok(Arc::new(manager))
+            }
+
+            #[cfg(not(feature = "wombatkv"))]
+            {
+                let _ = (wombat_config, instance_id);
+                anyhow::bail!("WombatKV object lock manager requires the 'wombatkv' feature")
+            }
         }
     }
 }
