@@ -96,6 +96,20 @@ class frontend_service:
     KV_HIT_RATE = "kv_hit_rate"
     # Upper-bound estimation of KV cache transfer latency in disaggregated serving (seconds)
     KV_TRANSFER_ESTIMATED_LATENCY_SECONDS = "kv_transfer_estimated_latency_seconds"
+    # Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
+    SHARED_CACHE_HIT_RATE = "shared_cache_hit_rate"
+    # Shared cache blocks beyond device overlap for the selected worker
+    SHARED_CACHE_BEYOND_BLOCKS = "shared_cache_beyond_blocks"
+    # Total shared cache lookups by outcome
+    SHARED_CACHE_QUERIES_TOTAL = "shared_cache_queries_total"
+    # Number of request blocks checked against the shared cache
+    SHARED_CACHE_REQUEST_BLOCKS = "shared_cache_request_blocks"
+    # Number of request blocks found in the shared cache
+    SHARED_CACHE_HIT_BLOCKS = "shared_cache_hit_blocks"
+    # Number of request blocks missing from the shared cache
+    SHARED_CACHE_MISS_BLOCKS = "shared_cache_miss_blocks"
+    # Number of prefill tokens covered by shared cache beyond selected worker device overlap
+    SHARED_CACHE_BEYOND_TOKENS = "shared_cache_beyond_tokens"
     # Number of cached tokens (prefix cache hits) per request
     CACHED_TOKENS = "cached_tokens"
     # Tokenizer latency in milliseconds
@@ -319,6 +333,20 @@ class router:
     OUTPUT_SEQUENCE_TOKENS = "router_output_sequence_tokens"
     # Predicted KV cache hit rate at routing time (0.0-1.0)
     KV_HIT_RATE = "router_kv_hit_rate"
+    # Shared cache hit rate (0.0-1.0): fraction of request blocks found in shared cache
+    SHARED_CACHE_HIT_RATE = "router_shared_cache_hit_rate"
+    # Shared cache blocks beyond device overlap for the selected worker
+    SHARED_CACHE_BEYOND_BLOCKS = "router_shared_cache_beyond_blocks"
+    # Total shared cache lookups by outcome
+    SHARED_CACHE_QUERIES_TOTAL = "router_shared_cache_queries_total"
+    # Number of request blocks checked against the shared cache
+    SHARED_CACHE_REQUEST_BLOCKS = "router_shared_cache_request_blocks"
+    # Number of request blocks found in the shared cache
+    SHARED_CACHE_HIT_BLOCKS = "router_shared_cache_hit_blocks"
+    # Number of request blocks missing from the shared cache
+    SHARED_CACHE_MISS_BLOCKS = "router_shared_cache_miss_blocks"
+    # Number of prefill tokens covered by shared cache beyond selected worker device overlap
+    SHARED_CACHE_BEYOND_TOKENS = "router_shared_cache_beyond_tokens"
 
 
 class router_request:

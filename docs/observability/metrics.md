@@ -388,6 +388,13 @@ All metrics carry the standard hierarchy labels (`dynamo_namespace`, `dynamo_com
 | `dynamo_component_router_input_sequence_tokens` | Histogram | Input sequence length (tokens) |
 | `dynamo_component_router_output_sequence_tokens` | Histogram | Output sequence length (tokens) |
 | `dynamo_component_router_kv_hit_rate` | Histogram | Predicted KV cache hit rate at routing time (0.0-1.0) |
+| `dynamo_component_router_shared_cache_hit_rate` | Histogram | Fraction of request blocks found in an external shared KV cache such as WombatKV |
+| `dynamo_component_router_shared_cache_beyond_blocks` | Histogram | Shared-cache blocks beyond the selected worker's device overlap |
+| `dynamo_component_router_shared_cache_queries_total` | Counter | Shared-cache lookups by `outcome=hit\|miss\|error` |
+| `dynamo_component_router_shared_cache_request_blocks` | Histogram | Request blocks checked against the shared cache |
+| `dynamo_component_router_shared_cache_hit_blocks` | Histogram | Request blocks found in the shared cache |
+| `dynamo_component_router_shared_cache_miss_blocks` | Histogram | Request blocks missing from the shared cache |
+| `dynamo_component_router_shared_cache_beyond_tokens` | Histogram | Prefill tokens covered by shared cache beyond the selected worker's device overlap |
 
 #### Per-Request Routing Overhead (`dynamo_router_overhead_*`)
 
@@ -400,6 +407,8 @@ Histograms (in milliseconds) tracking the time spent in each phase of the routin
 | `dynamo_router_overhead_seq_hashing_ms` | Histogram | Time computing sequence hashes |
 | `dynamo_router_overhead_scheduling_ms` | Histogram | Time in scheduler worker selection |
 | `dynamo_router_overhead_total_ms` | Histogram | Total routing overhead per request |
+| `dynamo_router_overhead_shared_cache_query_ms` | Histogram | Time spent querying the external shared KV cache |
+| `dynamo_router_shared_cache_errors_total` | Counter | Shared-cache query errors; router fails open and routes as empty hits |
 
 #### Router Queue Metrics (`dynamo_frontend_router_queue_*`)
 

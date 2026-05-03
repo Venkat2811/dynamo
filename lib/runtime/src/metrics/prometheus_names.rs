@@ -205,6 +205,21 @@ pub mod frontend_service {
     /// Shared cache blocks beyond device overlap for the selected worker
     pub const SHARED_CACHE_BEYOND_BLOCKS: &str = "shared_cache_beyond_blocks";
 
+    /// Total shared cache lookups by outcome
+    pub const SHARED_CACHE_QUERIES_TOTAL: &str = "shared_cache_queries_total";
+
+    /// Number of request blocks checked against the shared cache
+    pub const SHARED_CACHE_REQUEST_BLOCKS: &str = "shared_cache_request_blocks";
+
+    /// Number of request blocks found in the shared cache
+    pub const SHARED_CACHE_HIT_BLOCKS: &str = "shared_cache_hit_blocks";
+
+    /// Number of request blocks missing from the shared cache
+    pub const SHARED_CACHE_MISS_BLOCKS: &str = "shared_cache_miss_blocks";
+
+    /// Number of prefill tokens covered by shared cache beyond selected worker device overlap
+    pub const SHARED_CACHE_BEYOND_TOKENS: &str = "shared_cache_beyond_tokens";
+
     /// Number of cached tokens (prefix cache hits) per request
     pub const CACHED_TOKENS: &str = "cached_tokens";
 
@@ -581,6 +596,21 @@ pub mod router {
 
     /// Shared cache blocks beyond device overlap for the selected worker
     pub const SHARED_CACHE_BEYOND_BLOCKS: &str = "router_shared_cache_beyond_blocks";
+
+    /// Total shared cache lookups by outcome
+    pub const SHARED_CACHE_QUERIES_TOTAL: &str = "router_shared_cache_queries_total";
+
+    /// Number of request blocks checked against the shared cache
+    pub const SHARED_CACHE_REQUEST_BLOCKS: &str = "router_shared_cache_request_blocks";
+
+    /// Number of request blocks found in the shared cache
+    pub const SHARED_CACHE_HIT_BLOCKS: &str = "router_shared_cache_hit_blocks";
+
+    /// Number of request blocks missing from the shared cache
+    pub const SHARED_CACHE_MISS_BLOCKS: &str = "router_shared_cache_miss_blocks";
+
+    /// Number of prefill tokens covered by shared cache beyond selected worker device overlap
+    pub const SHARED_CACHE_BEYOND_TOKENS: &str = "router_shared_cache_beyond_tokens";
 }
 
 /// Frontend pipeline stage and event-loop metrics

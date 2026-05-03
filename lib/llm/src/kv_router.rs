@@ -528,6 +528,9 @@ where
                         if let Some(m) = metrics::RoutingOverheadMetrics::get() {
                             m.inc_shared_cache_errors();
                         }
+                        if let Some(m) = metrics::RouterRequestMetrics::get() {
+                            m.observe_shared_cache_error();
+                        }
                         None
                     }
                 };
@@ -603,6 +606,7 @@ where
             }
             let beyond = hits.hits_beyond(response.effective_overlap_blocks.round() as u32);
             m.shared_cache_beyond_blocks.observe(beyond as f64);
+            m.observe_shared_cache_success(num_blocks, hits.total_hits, beyond, self.block_size);
         }
 
         #[cfg(feature = "bench")]

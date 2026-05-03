@@ -51,6 +51,12 @@ use dynamo_runtime::metrics::prometheus_names::{
 fn router_metric(suffix: &str) -> String {
     format!("{}{}", router_request::METRIC_PREFIX, suffix)
 }
+
+const SHARED_CACHE_OUTCOME_LABEL: &str = "outcome";
+const SHARED_CACHE_OUTCOME_HIT: &str = "hit";
+const SHARED_CACHE_OUTCOME_MISS: &str = "miss";
+const SHARED_CACHE_OUTCOME_ERROR: &str = "error";
+
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use prometheus::{HistogramOpts, IntGaugeVec, Opts};
 
@@ -391,6 +397,11 @@ pub struct RouterRequestMetrics {
     pub kv_transfer_estimated_latency_seconds: prometheus::Histogram,
     pub shared_cache_hit_rate: prometheus::Histogram,
     pub shared_cache_beyond_blocks: prometheus::Histogram,
+    pub shared_cache_queries_total: prometheus::IntCounterVec,
+    pub shared_cache_request_blocks: prometheus::Histogram,
+    pub shared_cache_hit_blocks: prometheus::Histogram,
+    pub shared_cache_miss_blocks: prometheus::Histogram,
+    pub shared_cache_beyond_tokens: prometheus::Histogram,
 }
 
 static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
@@ -486,6 +497,48 @@ impl RouterRequestMetrics {
                         Some(prometheus::exponential_buckets(1.0, 2.0, 12).unwrap()),
                     )
                     .expect("failed to create router_shared_cache_beyond_blocks");
+                let shared_cache_queries_total = metrics
+                    .create_intcountervec(
+                        &router_metric(frontend_service::SHARED_CACHE_QUERIES_TOTAL),
+                        "Total shared cache lookups by outcome",
+                        &[SHARED_CACHE_OUTCOME_LABEL],
+                        extra_labels,
+                    )
+                    .expect("failed to create router_shared_cache_queries_total");
+                let block_buckets = generate_log_buckets(1.0, 8192.0, 14);
+                let token_buckets = generate_log_buckets(1.0, 128000.0, 16);
+                let shared_cache_request_blocks = metrics
+                    .create_histogram(
+                        &router_metric(frontend_service::SHARED_CACHE_REQUEST_BLOCKS),
+                        "Number of request blocks checked against the shared cache",
+                        extra_labels,
+                        Some(block_buckets.clone()),
+                    )
+                    .expect("failed to create router_shared_cache_request_blocks");
+                let shared_cache_hit_blocks = metrics
+                    .create_histogram(
+                        &router_metric(frontend_service::SHARED_CACHE_HIT_BLOCKS),
+                        "Number of request blocks found in the shared cache",
+                        extra_labels,
+                        Some(block_buckets.clone()),
+                    )
+                    .expect("failed to create router_shared_cache_hit_blocks");
+                let shared_cache_miss_blocks = metrics
+                    .create_histogram(
+                        &router_metric(frontend_service::SHARED_CACHE_MISS_BLOCKS),
+                        "Number of request blocks missing from the shared cache",
+                        extra_labels,
+                        Some(block_buckets),
+                    )
+                    .expect("failed to create router_shared_cache_miss_blocks");
+                let shared_cache_beyond_tokens = metrics
+                    .create_histogram(
+                        &router_metric(frontend_service::SHARED_CACHE_BEYOND_TOKENS),
+                        "Prefill tokens covered by shared cache beyond selected worker device overlap",
+                        extra_labels,
+                        Some(token_buckets),
+                    )
+                    .expect("failed to create router_shared_cache_beyond_tokens");
                 Arc::new(Self {
                     requests_total,
                     time_to_first_token_seconds,
@@ -496,9 +549,47 @@ impl RouterRequestMetrics {
                     kv_transfer_estimated_latency_seconds,
                     shared_cache_hit_rate,
                     shared_cache_beyond_blocks,
+                    shared_cache_queries_total,
+                    shared_cache_request_blocks,
+                    shared_cache_hit_blocks,
+                    shared_cache_miss_blocks,
+                    shared_cache_beyond_tokens,
                 })
             })
             .clone()
+    }
+
+    pub fn observe_shared_cache_success(
+        &self,
+        request_blocks: usize,
+        hit_blocks: u32,
+        beyond_blocks: u32,
+        block_size: u32,
+    ) {
+        let request_blocks_u32 = u32::try_from(request_blocks).unwrap_or(u32::MAX);
+        let bounded_hits = hit_blocks.min(request_blocks_u32);
+        let miss_blocks = request_blocks_u32.saturating_sub(bounded_hits);
+        let outcome = if bounded_hits > 0 {
+            SHARED_CACHE_OUTCOME_HIT
+        } else {
+            SHARED_CACHE_OUTCOME_MISS
+        };
+
+        self.shared_cache_queries_total
+            .with_label_values(&[outcome])
+            .inc();
+        self.shared_cache_request_blocks
+            .observe(request_blocks as f64);
+        self.shared_cache_hit_blocks.observe(bounded_hits as f64);
+        self.shared_cache_miss_blocks.observe(miss_blocks as f64);
+        self.shared_cache_beyond_tokens
+            .observe((beyond_blocks as u64 * block_size as u64) as f64);
+    }
+
+    pub fn observe_shared_cache_error(&self) {
+        self.shared_cache_queries_total
+            .with_label_values(&[SHARED_CACHE_OUTCOME_ERROR])
+            .inc();
     }
 }
 
@@ -732,6 +823,65 @@ dynamo_frontend_router_queue_pending_requests{worker_type=\"decode\"} 5
             Duration::from_millis(1),
         );
         // Reaching here without panic confirms saturating_sub works
+    }
+
+    #[test]
+    fn test_router_request_shared_cache_outcome_metrics() {
+        let buckets = prometheus::linear_buckets(0.0, 1.0, 4).unwrap();
+        let make_histogram = |name: &str| {
+            prometheus::Histogram::with_opts(
+                prometheus::HistogramOpts::new(name, "test").buckets(buckets.clone()),
+            )
+            .unwrap()
+        };
+
+        let metrics = RouterRequestMetrics {
+            requests_total: prometheus::IntCounter::new("test_router_requests_total", "test")
+                .unwrap(),
+            time_to_first_token_seconds: make_histogram("test_router_ttft_seconds"),
+            inter_token_latency_seconds: make_histogram("test_router_itl_seconds"),
+            input_sequence_tokens: make_histogram("test_router_input_tokens"),
+            output_sequence_tokens: make_histogram("test_router_output_tokens"),
+            kv_hit_rate: make_histogram("test_router_kv_hit_rate"),
+            kv_transfer_estimated_latency_seconds: make_histogram("test_router_transfer_seconds"),
+            shared_cache_hit_rate: make_histogram("test_router_shared_cache_hit_rate"),
+            shared_cache_beyond_blocks: make_histogram("test_router_shared_cache_beyond_blocks"),
+            shared_cache_queries_total: prometheus::IntCounterVec::new(
+                prometheus::Opts::new("test_router_shared_cache_queries_total", "test"),
+                &[SHARED_CACHE_OUTCOME_LABEL],
+            )
+            .unwrap(),
+            shared_cache_request_blocks: make_histogram("test_router_shared_cache_request_blocks"),
+            shared_cache_hit_blocks: make_histogram("test_router_shared_cache_hit_blocks"),
+            shared_cache_miss_blocks: make_histogram("test_router_shared_cache_miss_blocks"),
+            shared_cache_beyond_tokens: make_histogram("test_router_shared_cache_beyond_tokens"),
+        };
+
+        metrics.observe_shared_cache_success(10, 4, 2, 16);
+        metrics.observe_shared_cache_success(10, 0, 0, 16);
+        metrics.observe_shared_cache_error();
+
+        assert_eq!(
+            metrics
+                .shared_cache_queries_total
+                .with_label_values(&[SHARED_CACHE_OUTCOME_HIT])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .shared_cache_queries_total
+                .with_label_values(&[SHARED_CACHE_OUTCOME_MISS])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .shared_cache_queries_total
+                .with_label_values(&[SHARED_CACHE_OUTCOME_ERROR])
+                .get(),
+            1
+        );
     }
 
     #[test]
