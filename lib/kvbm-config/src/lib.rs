@@ -24,7 +24,9 @@ pub use discovery::{
 pub use events::{BatchingConfig as EventsBatchingConfig, EventPolicyConfig, EventsConfig};
 pub use messenger::{MessengerBackendConfig, MessengerConfig};
 pub use nixl::NixlConfig;
-pub use object::{NixlObjectConfig, ObjectClientConfig, ObjectConfig, S3ObjectConfig};
+pub use object::{
+    NixlObjectConfig, ObjectClientConfig, ObjectConfig, S3ObjectConfig, WombatKvObjectConfig,
+};
 pub use offload::{
     OffloadConfig, PolicyType, PresenceFilterConfig, PresenceLfuFilterConfig, TierOffloadConfig,
 };

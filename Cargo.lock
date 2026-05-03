@@ -4575,6 +4575,7 @@ dependencies = [
  "kvbm-logical",
  "kvbm-physical",
  "libc",
+ "libloading 0.8.9",
  "nvtx",
  "oneshot",
  "parking_lot",

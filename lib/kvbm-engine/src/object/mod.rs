@@ -27,6 +27,8 @@ use kvbm_physical::transfer::PhysicalLayout;
 
 #[cfg(feature = "s3")]
 pub mod s3;
+#[cfg(feature = "wombatkv")]
+pub mod wombatkv;
 
 // ============================================================================
 // Key Formatting
@@ -324,35 +326,59 @@ pub trait ObjectLockManager: Send + Sync {
 /// # Errors
 /// Returns an error if the object client cannot be initialized or if the
 /// required feature is not enabled.
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "wombatkv"))]
 pub async fn create_object_client(
     config: &kvbm_config::ObjectConfig,
     rank: Option<usize>,
 ) -> Result<Arc<dyn ObjectBlockOps>> {
-    use kvbm_config::ObjectClientConfig;
-    use s3::{S3Config, S3ObjectBlockClient};
-
     let key_formatter = create_key_formatter(rank);
 
     match &config.client {
-        ObjectClientConfig::S3(s3_config) => {
-            let config = S3Config::from_object_config(s3_config);
-            let client = S3ObjectBlockClient::with_key_formatter(config, key_formatter).await?;
-            Ok(Arc::new(client))
+        kvbm_config::ObjectClientConfig::S3(s3_config) => {
+            #[cfg(feature = "s3")]
+            {
+                use s3::{S3Config, S3ObjectBlockClient};
+
+                let config = S3Config::from_object_config(s3_config);
+                let client = S3ObjectBlockClient::with_key_formatter(config, key_formatter).await?;
+                Ok(Arc::new(client))
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = s3_config;
+                anyhow::bail!("S3 object storage requires the 's3' feature")
+            }
         }
-        ObjectClientConfig::Nixl(_nixl_config) => {
+        kvbm_config::ObjectClientConfig::Nixl(_nixl_config) => {
             anyhow::bail!("Nixl object storage backend not yet implemented")
+        }
+        kvbm_config::ObjectClientConfig::WombatKv(wombat_config) => {
+            #[cfg(feature = "wombatkv")]
+            {
+                let client = wombatkv::WombatKvObjectBlockClient::with_key_formatter(
+                    wombat_config.clone(),
+                    key_formatter,
+                )?;
+                Ok(Arc::new(client))
+            }
+
+            #[cfg(not(feature = "wombatkv"))]
+            {
+                let _ = wombat_config;
+                anyhow::bail!("WombatKV object storage requires the 'wombatkv' feature")
+            }
         }
     }
 }
 
-/// Fallback when S3 feature is disabled.
-#[cfg(not(feature = "s3"))]
+/// Fallback when all object-storage features are disabled.
+#[cfg(not(any(feature = "s3", feature = "wombatkv")))]
 pub async fn create_object_client(
     _config: &kvbm_config::ObjectConfig,
     _rank: Option<usize>,
 ) -> Result<Arc<dyn ObjectBlockOps>> {
-    anyhow::bail!("Object storage requires the 's3' feature to be enabled")
+    anyhow::bail!("Object storage requires the 's3' or 'wombatkv' feature to be enabled")
 }
 
 /// Create a lock manager from configuration.
@@ -366,33 +392,47 @@ pub async fn create_object_client(
 /// # Errors
 /// Returns an error if the lock manager cannot be initialized or if the
 /// required feature is not enabled.
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "wombatkv"))]
 pub async fn create_lock_manager(
     config: &kvbm_config::ObjectConfig,
     instance_id: String,
 ) -> Result<Arc<dyn ObjectLockManager>> {
-    use kvbm_config::ObjectClientConfig;
-    use s3::{S3Config, S3LockManager, S3ObjectBlockClient};
-
     match &config.client {
-        ObjectClientConfig::S3(s3_config) => {
-            let config = S3Config::from_object_config(s3_config);
-            // Lock manager uses default key formatter (no rank prefix for lock/meta files)
-            let client = Arc::new(S3ObjectBlockClient::new(config).await?);
-            let manager = S3LockManager::new(client, instance_id);
-            Ok(Arc::new(manager))
+        kvbm_config::ObjectClientConfig::S3(s3_config) => {
+            #[cfg(feature = "s3")]
+            {
+                use s3::{S3Config, S3LockManager, S3ObjectBlockClient};
+
+                let config = S3Config::from_object_config(s3_config);
+                // Lock manager uses default key formatter (no rank prefix for lock/meta files)
+                let client = Arc::new(S3ObjectBlockClient::new(config).await?);
+                let manager = S3LockManager::new(client, instance_id);
+                Ok(Arc::new(manager))
+            }
+
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = (s3_config, instance_id);
+                anyhow::bail!("S3 object lock manager requires the 's3' feature")
+            }
         }
-        ObjectClientConfig::Nixl(_nixl_config) => {
+        kvbm_config::ObjectClientConfig::Nixl(_nixl_config) => {
             anyhow::bail!("Nixl object storage backend not yet implemented")
+        }
+        kvbm_config::ObjectClientConfig::WombatKv(_wombat_config) => {
+            let _ = instance_id;
+            anyhow::bail!(
+                "WombatKV object lock manager requires a TensorPuffer conditional-put/CAS API"
+            )
         }
     }
 }
 
-/// Fallback when S3 feature is disabled.
-#[cfg(not(feature = "s3"))]
+/// Fallback when all object-storage features are disabled.
+#[cfg(not(any(feature = "s3", feature = "wombatkv")))]
 pub async fn create_lock_manager(
     _config: &kvbm_config::ObjectConfig,
     _instance_id: String,
 ) -> Result<Arc<dyn ObjectLockManager>> {
-    anyhow::bail!("Object storage requires the 's3' feature to be enabled")
+    anyhow::bail!("Object storage requires the 's3' or 'wombatkv' feature to be enabled")
 }

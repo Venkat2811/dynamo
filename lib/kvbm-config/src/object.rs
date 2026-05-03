@@ -28,6 +28,9 @@ pub enum ObjectClientConfig {
     S3(S3ObjectConfig),
     /// NIXL agent with object storage backend.
     Nixl(NixlObjectConfig),
+    /// TensorPuffer/WombatKV object-tier client via the TensorPuffer C ABI.
+    #[serde(alias = "tensorpuffer")]
+    WombatKv(WombatKvObjectConfig),
 }
 
 /// S3-compatible object storage configuration.
@@ -98,6 +101,51 @@ impl S3ObjectConfig {
             region: default_region(),
             force_path_style: true,
             max_concurrent_requests: default_max_concurrent(),
+        }
+    }
+}
+
+/// TensorPuffer/WombatKV object-tier configuration.
+///
+/// WombatKV stores blocks under `(namespace, key)`. Dynamo supplies the block
+/// key from `SequenceHash` plus any worker rank prefix; this config supplies the
+/// WombatKV namespace and optional namespace-relative key prefix.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct WombatKvObjectConfig {
+    /// WombatKV namespace used for KVBM G4 blocks.
+    #[serde(default = "default_wombatkv_namespace")]
+    pub namespace: String,
+
+    /// Optional prefix prepended to Dynamo-formatted block keys.
+    #[serde(default)]
+    pub key_prefix: Option<String>,
+
+    /// Optional path to `libtensorpuffer.so` / `libtensorpuffer.dylib`.
+    /// If omitted, the runtime uses the platform dynamic-loader search path.
+    #[serde(default)]
+    pub lib_path: Option<String>,
+
+    /// Maximum number of concurrent WombatKV C ABI calls.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_requests: usize,
+
+    /// Rehydrate local WombatKV tiers for `namespace` during client init.
+    #[serde(default)]
+    pub restore_on_init: bool,
+}
+
+fn default_wombatkv_namespace() -> String {
+    "kvbm".to_string()
+}
+
+impl Default for WombatKvObjectConfig {
+    fn default() -> Self {
+        Self {
+            namespace: default_wombatkv_namespace(),
+            key_prefix: None,
+            lib_path: None,
+            max_concurrent_requests: default_max_concurrent(),
+            restore_on_init: false,
         }
     }
 }
@@ -185,6 +233,53 @@ mod tests {
                 assert!(s3.force_path_style);
             }
             _ => panic!("Expected Nixl S3 config"),
+        }
+    }
+
+    #[test]
+    fn test_object_config_serde_wombatkv() {
+        let json = r#"{
+            "client": {
+                "type": "wombatkv",
+                "namespace": "dynamo-kvbm",
+                "key_prefix": "g4",
+                "lib_path": "/opt/tensorpuffer/libtensorpuffer.so",
+                "max_concurrent_requests": 8,
+                "restore_on_init": true
+            }
+        }"#;
+        let config: ObjectConfig = serde_json::from_str(json).unwrap();
+        match config.client {
+            ObjectClientConfig::WombatKv(wombat) => {
+                assert_eq!(wombat.namespace, "dynamo-kvbm");
+                assert_eq!(wombat.key_prefix, Some("g4".into()));
+                assert_eq!(
+                    wombat.lib_path,
+                    Some("/opt/tensorpuffer/libtensorpuffer.so".into())
+                );
+                assert_eq!(wombat.max_concurrent_requests, 8);
+                assert!(wombat.restore_on_init);
+            }
+            _ => panic!("Expected WombatKV config"),
+        }
+    }
+
+    #[test]
+    fn test_object_config_serde_tensorpuffer_alias() {
+        let json = r#"{
+            "client": {
+                "type": "tensorpuffer",
+                "namespace": "alias"
+            }
+        }"#;
+        let config: ObjectConfig = serde_json::from_str(json).unwrap();
+        match config.client {
+            ObjectClientConfig::WombatKv(wombat) => {
+                assert_eq!(wombat.namespace, "alias");
+                assert_eq!(wombat.max_concurrent_requests, 16);
+                assert!(!wombat.restore_on_init);
+            }
+            _ => panic!("Expected WombatKV config"),
         }
     }
 }
