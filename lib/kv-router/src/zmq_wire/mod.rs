@@ -81,6 +81,7 @@ pub enum ZmqEventFilterReason {
     UnknownKind,
     NonMainAttentionGroup,
     UnlearnedGroupIdx,
+    BlockSizeMismatch,
 }
 
 impl ZmqEventFilterReason {
@@ -96,6 +97,7 @@ impl ZmqEventFilterReason {
             Self::UnknownKind => "unknown_kind",
             Self::NonMainAttentionGroup => "non_main_attention_group",
             Self::UnlearnedGroupIdx => "unlearned_group_idx",
+            Self::BlockSizeMismatch => "block_size_mismatch",
         }
     }
 }
@@ -206,6 +208,22 @@ impl ZmqEventNormalizer {
         }
         if let Some(reason) = self.filter_reason(metadata, worker.dp_rank) {
             return Err(reason);
+        }
+        // A store whose block_size differs from the indexer's kv_block_size can
+        // never yield an indexable block: `create_stored_blocks` skips every
+        // hash of such an event, so conversion would emit a Stored event with
+        // zero blocks but with its parent hash, and the radix tree then answers
+        // ParentBlockNotFound for a block that was never meant to be indexed.
+        // vLLM emits these at the end of every prefill on engines that hash the
+        // partial tail at a finer granularity (e.g. a 128-token tail block next
+        // to 12,288-token full blocks on Kimi-K3 with TP8 x DCP8), so without
+        // this gate the parent_block_not_found counter grows by about one per
+        // request and stops being a health signal. Classify them as filtered
+        // here, like the locality and medium gates, so no event id is burned.
+        if let RawKvEvent::BlockStored { block_size, .. } = &raw
+            && *block_size as u64 != self.kv_block_size as u64
+        {
+            return Err(ZmqEventFilterReason::BlockSizeMismatch);
         }
         self.propagate_cache_namespace(&mut raw, worker)?;
         Ok(raw)

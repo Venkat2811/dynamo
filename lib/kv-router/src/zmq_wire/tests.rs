@@ -1299,6 +1299,75 @@ fn test_preprocess_rejects_non_local_locality_for_every_tier() {
     }
 }
 
+/// A BlockStored whose `block_size` is not the indexer's `kv_block_size` can
+/// never produce an indexable block (`create_stored_blocks` skips every hash of
+/// it), so conversion would forward a Stored event with zero blocks and a parent
+/// hash, and the radix tree would count a spurious `ParentBlockNotFound`. vLLM
+/// emits such an event at the end of every prefill on engines that hash the
+/// partial tail at a finer granularity (a 128-token tail block next to
+/// 12,288-token full blocks on Kimi-K3 with TP8 x DCP8). Preprocess must classify
+/// it as filtered (`BlockSizeMismatch`) before any normalizer state is touched;
+/// matching sizes still pass, and lower tiers keep their bypass.
+#[test]
+fn test_preprocess_filters_block_size_mismatch() {
+    let worker = WorkerWithDpRank::new(3, 0);
+    let kv_block_size = 12_288u32;
+
+    let tail_block = |block_size: usize, medium: &str| RawKvEvent::BlockStored {
+        block_hashes: vec![BlockHashValue::Unsigned(0xfeed)],
+        parent_block_hash: Some(BlockHashValue::Unsigned(0xbeef)),
+        token_ids: (0..block_size as u32).collect(),
+        block_size,
+        medium: Some(medium.to_string()),
+        lora_name: None,
+        cache_namespace: None,
+        block_mm_infos: None,
+        is_eagle: Some(false),
+        group_idx: Some(0),
+        kv_cache_spec_kind: Some(KvCacheSpecKind::MlaAttention),
+        kv_cache_spec_sliding_window: None,
+        locality: Some(Locality::Local),
+        ownership: None,
+    };
+
+    // Undersized (128-token tail) and oversized stores are filtered, on both
+    // normalizer-path tiers.
+    for medium in ["GPU", "CPU"] {
+        for block_size in [128usize, 1_536, 24_576] {
+            let mut normalizer = ZmqEventNormalizer::new(kv_block_size);
+            assert_eq!(
+                normalizer
+                    .preprocess_with_reason(tail_block(block_size, medium), worker)
+                    .unwrap_err(),
+                ZmqEventFilterReason::BlockSizeMismatch,
+                "block_size {block_size} on {medium} must be filtered as a size mismatch"
+            );
+        }
+    }
+
+    // The matching size still passes, and converts to exactly one stored block.
+    let mut normalizer = ZmqEventNormalizer::new(kv_block_size);
+    let full = normalizer
+        .preprocess_with_reason(tail_block(kv_block_size as usize, "GPU"), worker)
+        .expect("a full-size block must pass preprocess");
+    let placement = normalizer
+        .normalize_preprocessed(full, 1, worker)
+        .expect("a full-size block must convert");
+    match placement.event.data {
+        KvCacheEventData::Stored(store) => assert_eq!(store.blocks.len(), 1),
+        other => panic!("expected a Stored event, got {other:?}"),
+    }
+
+    // Lower tiers bypass the normalizer and are not size-gated here.
+    let mut normalizer = ZmqEventNormalizer::new(kv_block_size);
+    assert!(
+        normalizer
+            .preprocess_with_reason(tail_block(128, "STORAGE"), worker)
+            .is_ok(),
+        "STORAGE events keep their preprocess bypass"
+    );
+}
+
 /// Unrecognized media must be classified as filtered in `preprocess_with_reason`
 /// (reason `UnknownMedium`), so the listener records an intentional filter rather
 /// than accepting the event, burning a next_event_id, and dropping it only in
